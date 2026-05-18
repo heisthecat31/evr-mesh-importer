@@ -155,6 +155,18 @@ def _pack_stream0_s28_ff(vertex_count):
     return record * vertex_count
 
 
+def _pack_stream0_s44(vertex_count, uvs=None):
+    """
+    Stream-0 stride-44: props and environment assets.
+    Layout: 0xFF000000 0xFF000000 [UV.u:float32] [UV.v:float32] [UV.u:float32] [UV.v:float32] followed by 20 bytes of zero padding.
+    """
+    out = bytearray()
+    for i in range(vertex_count):
+        u, v = uvs[i] if uvs else (0.0, 0.0)
+        out += struct.pack('<IIffff', 0xFF000000, 0xFF000000, u, v, u, v) + b'\x00' * 20
+    return bytes(out)
+
+
 def _pack_stream0_dynamic(vertex_count, stride, uvs=None):
     """
     Dynamically pack stream-0 to match the required stride perfectly.
@@ -164,6 +176,8 @@ def _pack_stream0_dynamic(vertex_count, stride, uvs=None):
         return _pack_stream0_s16(vertex_count, uvs=uvs)
     elif stride == 20:
         return _pack_stream0_s20_white(vertex_count, uvs=uvs)
+    elif stride == 44:
+        return _pack_stream0_s44(vertex_count, uvs=uvs)
 
     out = bytearray()
     for i in range(vertex_count):
@@ -853,7 +867,7 @@ def encode_primary_described_multi_submesh_replace(
 
         # Read original parameters from template
         off_ob, orig_vc, orig_s0_size, orig_fc = ob_blocks[block_idx]
-        orig_s0_start = struct.unpack_from('<I', original_primary_bytes, descriptor_offs[block_idx] + 4*4)[0]
+        orig_s0_start = struct.unpack_from('<I', original_primary_bytes, off_ob + 2*4)[0]
         rec_off_a5, orig_ib_offset, orig_ib_icount = array5_records[block_idx]
 
         # Capacity checks
