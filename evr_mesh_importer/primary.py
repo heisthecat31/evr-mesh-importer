@@ -7,26 +7,33 @@ https://github.com/Dualgame/evr-mesh-importer
 import os
 
 
-def _find_primary_data(gpu_filepath):
-    """Try to find and load a matching Primary binary for the given GPU file.
+def _find_primary_path(gpu_filepath):
+    """Try to find the matching Primary binary file path for the given GPU file.
     Supports hash-based directories (e.g. e7a8ab5ceaef49cb -> 37102e4b27955a14).
     """
     fname = os.path.basename(gpu_filepath)
     parent = os.path.dirname(gpu_filepath)
     grandparent = os.path.dirname(parent)
 
-    # 1. Flat hash sibling: e7a8ab5ceaef49cb/fname -> 37102e4b27955a14/fname
-    candidate1 = os.path.join(grandparent, "37102e4b27955a14", fname)
-    if os.path.isfile(candidate1):
-        with open(candidate1, "rb") as fh:
-            return fh.read()
+    gpu_to_primary = {
+        "e7a8ab5ceaef49cb": "37102e4b27955a14",
+        "e642bfb1abcf76df": "4e426f88c1b5d7ac",
+        "CGMeshListResource": "CGMeshListResource",
+        "CGInstancedModelResource": "CGInstancedModelResource",
+    }
+    parent_folder = os.path.basename(parent)
+    primary_folder = gpu_to_primary.get(parent_folder, "37102e4b27955a14")
 
-    # 2. Nested hash sibling: GPU/e7a8ab5ceaef49cb/fname -> Primary/37102e4b27955a14/fname
+    # 1. Flat hash sibling: parent/fname -> sibling/fname
+    candidate1 = os.path.join(grandparent, primary_folder, fname)
+    if os.path.isfile(candidate1):
+        return candidate1
+
+    # 2. Nested hash sibling: GPU/parent/fname -> Primary/sibling/fname
     ggparent = os.path.dirname(grandparent)
-    candidate2 = os.path.join(ggparent, "Primary", "37102e4b27955a14", fname)
+    candidate2 = os.path.join(ggparent, "Primary", primary_folder, fname)
     if os.path.isfile(candidate2):
-        with open(candidate2, "rb") as fh:
-            return fh.read()
+        return candidate2
 
     # 3. Recursive fallback under grandparent
     if os.path.isdir(grandparent):
@@ -36,8 +43,7 @@ def _find_primary_data(gpu_filepath):
                 if c != gpu_filepath and os.path.isfile(c):
                     lower_path = c.lower().replace(os.sep, "/")
                     if "primary" in lower_path or "37102e4b" in lower_path:
-                        with open(c, "rb") as fh:
-                            return fh.read()
+                        return c
 
     # 4. Original conventions
     family = os.path.basename(parent)
@@ -49,12 +55,19 @@ def _find_primary_data(gpu_filepath):
                 1,
             )
             if candidate != gpu_filepath and os.path.isfile(candidate):
-                with open(candidate, "rb") as fh:
-                    return fh.read()
+                return candidate
 
     sibling = os.path.join(grandparent, "Primary", fname)
     if os.path.isfile(sibling):
-        with open(sibling, "rb") as fh:
-            return fh.read()
+        return sibling
 
+    return None
+
+
+def _find_primary_data(gpu_filepath):
+    """Try to find and load a matching Primary binary for the given GPU file."""
+    path = _find_primary_path(gpu_filepath)
+    if path and os.path.isfile(path):
+        with open(path, "rb") as fh:
+            return fh.read()
     return None

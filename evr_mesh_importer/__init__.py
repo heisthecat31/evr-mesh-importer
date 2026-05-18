@@ -171,7 +171,7 @@ class EVR_OT_ImportMesh(Operator, ImportHelper):
             return None
 
         base_name = os.path.splitext(os.path.basename(gpu_path))[0]
-        valid = [(v, f) for v, f in submeshes if v and f]
+        valid = [(sub[0], sub[1]) for sub in submeshes if len(sub) >= 2 and sub[0] and sub[1]]
 
         parent_empty = None
         if len(valid) > 1:
@@ -181,7 +181,13 @@ class EVR_OT_ImportMesh(Operator, ImportHelper):
             bpy.context.collection.objects.link(parent_empty)
 
         created = []
-        for idx, (verts, faces) in enumerate(submeshes):
+        for idx, sub in enumerate(submeshes):
+            if len(sub) == 3:
+                verts, faces, uvs = sub
+            else:
+                verts, faces = sub
+                uvs = None
+
             if not verts or not faces:
                 continue
 
@@ -191,6 +197,17 @@ class EVR_OT_ImportMesh(Operator, ImportHelper):
 
             name = base_name if parent_empty is None else f"{base_name}.{idx:03d}"
             obj = _build_blender_mesh(verts, faces, name)
+
+            # Assign UVs if present in the imported data
+            if uvs and obj.data:
+                uv_layer = obj.data.uv_layers.new(name="UVMap")
+                for poly in obj.data.polygons:
+                    for loop_idx in poly.loop_indices:
+                        loop = obj.data.loops[loop_idx]
+                        v_idx = loop.vertex_index
+                        if v_idx < len(uvs):
+                            uv_layer.data[loop_idx].uv = uvs[v_idx]
+
             if not self.use_smooth:
                 _apply_flat_shading(obj)
             if parent_empty is not None:
@@ -258,6 +275,10 @@ class EVR_OT_ExportMesh(Operator, ExportHelper):
             ('primary_described', "Primary Described (also writes Primary file)",
              "Most accurate. Also writes a matching Primary binary alongside "
              "the GPU file. Use for files decoded as 'primary_described'."),
+            ('primary_described_patch', "Primary Described (In-place Patch)",
+             "Surgically patches vertex positions inside the original GPU binary in-place, "
+             "leaving file size and LODs/shadow geometry completely original. "
+             "Use to prevent load crashes on complex instanced props."),
             ('cgml',            "CGML — map geometry (multi-submesh)",
              "Encodes each material slot as a separate submesh. "
              "Use for CGMeshListResource map files."),
@@ -289,12 +310,13 @@ class EVR_OT_ExportMesh(Operator, ExportHelper):
 
     stream0_stride: EnumProperty(
         name="Stream-0 Stride",
-        description="Stride of the original file's stream-0 (16 or 20 bytes).",
+        description="Stride of the original file's stream-0 (Auto-detect, 16, or 20 bytes).",
         items=[
+            ('auto', "Auto-Detect", "Automatically detect from the original Primary template file"),
             ('16', "16 bytes", "Original used stride-16 stream-0"),
             ('20', "20 bytes", "Original used stride-20 stream-0"),
         ],
-        default='16',
+        default='auto',
     )
 
     # ---- transform ----
@@ -306,6 +328,24 @@ class EVR_OT_ExportMesh(Operator, ExportHelper):
         max=10000.0,
         soft_min=0.01,
         soft_max=100.0,
+    )
+
+    scale_x: FloatProperty(
+        name="Scale X",
+        description="Scale factor applied to X coordinates during in-place patching",
+        default=1.0,
+    )
+
+    scale_y: FloatProperty(
+        name="Scale Y",
+        description="Scale factor applied to Y coordinates during in-place patching",
+        default=1.0,
+    )
+
+    scale_z: FloatProperty(
+        name="Scale Z",
+        description="Scale factor applied to Z coordinates during in-place patching",
+        default=1.0,
     )
 
     @classmethod
@@ -326,7 +366,7 @@ class EVR_OT_ExportMesh(Operator, ExportHelper):
                     self.report({'ERROR'}, "No geometry found in material slots.")
                     return {'CANCELLED'}
             else:
-                verts, faces = mesh_from_blender_object(
+                verts, faces, uvs = mesh_from_blender_object(
                     obj, apply_transforms=True, split_by_material=False)
         except ValueError as e:
             self.report({'ERROR'}, str(e))
@@ -337,8 +377,8 @@ class EVR_OT_ExportMesh(Operator, ExportHelper):
             if self.scale != 1.0:
                 s = self.scale
                 submeshes = [
-                    ([(x*s, y*s, z*s) for x, y, z in v], f)
-                    for v, f in submeshes
+                    ([(x*s, y*s, z*s) for x, y, z in v], f, u)
+                    for v, f, u in submeshes
                 ]
         else:
             if self.scale != 1.0:
@@ -350,12 +390,12 @@ class EVR_OT_ExportMesh(Operator, ExportHelper):
             cn = self.compute_normals
 
             if self.encode_mode == 'heuristic_s16':
-                gpu_data = encode_heuristic_s16(verts, faces, compute_normals=cn)
+                gpu_data = encode_heuristic_s16(verts, faces, uvs=uvs, compute_normals=cn)
                 self._write_gpu(out_path, gpu_data)
                 self._report_ok(obj.name, verts, faces, out_path)
 
             elif self.encode_mode == 'heuristic_s20':
-                gpu_data = encode_heuristic_s20(verts, faces, compute_normals=cn)
+                gpu_data = encode_heuristic_s20(verts, faces, uvs=uvs, compute_normals=cn)
                 self._write_gpu(out_path, gpu_data)
                 self._report_ok(obj.name, verts, faces, out_path)
 
@@ -365,117 +405,119 @@ class EVR_OT_ExportMesh(Operator, ExportHelper):
                 self._report_ok(obj.name, verts, faces, out_path)
 
             elif self.encode_mode == 'primary_described':
-                s0_stride = int(self.stream0_stride)
-                gpu_data, primary_data = encode_primary_described(
-                    verts, faces, stream0_stride=s0_stride, compute_normals=cn)
-                self._write_gpu(out_path, gpu_data)
-                if self.write_primary:
-                    ppath = self._primary_sibling_path(out_path)
-                    if ppath:
-                        os.makedirs(os.path.dirname(ppath), exist_ok=True)
-                        patched = False
-                        if os.path.exists(ppath):
-                            with open(ppath, 'rb') as f:
-                                orig_bytes = f.read()
-                            
-                            if len(orig_bytes) > 64:
-                                import struct
-                                patched_bytes = bytearray(orig_bytes)
-                                n = len(patched_bytes)
-                                i = 0
-                                block_count = 0
-                                nv = len(verts)
-                                nt = len(faces)
-                                stream0_size = nv * s0_stride
-                                index_offset = stream0_size + nv * 28
-                                index_words = nt * 3
-                                
-                                while i <= n - 64:
-                                    sentinel = struct.unpack_from('<I', patched_bytes, i)[0]
-                                    if sentinel == 0x0B:
-                                        vc = struct.unpack_from('<I', patched_bytes, i + 7*4)[0]
-                                        vc2 = struct.unpack_from('<I', patched_bytes, i + 8*4)[0]
-                                        vc3 = struct.unpack_from('<I', patched_bytes, i + 11*4)[0]
-                                        if vc == vc2 == vc3 and vc > 0:
-                                            orig_rk = struct.unpack_from('<I', patched_bytes, i + 14*4)[0]
-                                            if orig_rk == 2:
-                                                new_block = struct.pack('<16I',
-                                                    0x0B,            # [0] sentinel
-                                                    0,               # [1] padding
-                                                    0,               # [2] base_offset (0 = linear layout)
-                                                    0,               # [3] padding
-                                                    stream0_size,    # [4] stream0_size
-                                                    0,               # [5] unused
-                                                    0,               # [6] unused
-                                                    nv,              # [7] vertex_count
-                                                    nv,              # [8] vertex_count copy
-                                                    0,               # [9] unused
-                                                    0,               # [10] unused
-                                                    nv,              # [11] vertex_count copy
-                                                    index_offset,    # [12] index_offset
-                                                    index_words,     # [13] index_words
-                                                    2,               # [14] range_kind = 2
-                                                    0,               # [15] unused
-                                                )
-                                            else:
-                                                orig_idx_off = struct.unpack_from('<I', patched_bytes, i + 12*4)[0]
-                                                orig_idx_words = struct.unpack_from('<I', patched_bytes, i + 13*4)[0]
-                                                orig_extra = struct.unpack_from('<I', patched_bytes, i + 15*4)[0]
-                                                new_block = struct.pack('<16I',
-                                                    0x0B,            # [0] sentinel
-                                                    0,               # [1] padding
-                                                    0,               # [2] base_offset (0 = linear layout)
-                                                    0,               # [3] padding
-                                                    stream0_size,    # [4] stream0_size
-                                                    0,               # [5] unused
-                                                    0,               # [6] unused
-                                                    nv,              # [7] vertex_count
-                                                    nv,              # [8] vertex_count copy
-                                                    0,               # [9] unused
-                                                    0,               # [10] unused
-                                                    nv,              # [11] vertex_count copy
-                                                    orig_idx_off,    # [12] keep original index_offset
-                                                    orig_idx_words,  # [13] keep original index_words
-                                                    orig_rk,         # [14] keep original range_kind
-                                                    orig_extra,      # [15] keep original range_extra
-                                                )
-                                            patched_bytes[i:i+64] = new_block
-                                            block_count += 1
-                                            i += 64
-                                            continue
-                                    i += 4
-                                
-                                if block_count > 0:
-                                    with open(ppath, 'wb') as f:
-                                        f.write(patched_bytes)
-                                    self.report({'INFO'}, f"Patched {block_count} descriptor block(s) in-place in {os.path.basename(ppath)}")
-                                    patched = True
-                                else:
-                                    self.report({'WARNING'}, f"No valid 0x0B blocks found in original {os.path.basename(ppath)}. Writing raw descriptor.")
-                            else:
-                                self.report({'WARNING'}, f"{os.path.basename(ppath)} was already overwritten/truncated. Please restore original file for best compatibility.")
+                s0_stride = None if self.stream0_stride == 'auto' else int(self.stream0_stride)
+                gpu_path = out_path
+                from .primary import _find_primary_path
+                primary_path = _find_primary_path(gpu_path)
+                
+                patched = False
+                if primary_path and os.path.exists(primary_path) and os.path.exists(gpu_path):
+                    with open(gpu_path, 'rb') as f:
+                        orig_gpu = f.read()
+                    with open(primary_path, 'rb') as f:
+                        orig_primary = f.read()
+                    
+                    if len(orig_primary) > 64:
+                        # Count how many rendering blocks are in the original Primary template
+                        block_count = 0
+                        import struct
+                        n_meta = len(orig_primary)
+                        for off in range(0, n_meta - 60, 4):
+                            val = struct.unpack_from('<I', orig_primary, off)[0]
+                            if val == 0x0B:
+                                vc = struct.unpack_from('<I', orig_primary, off + 7*4)[0]
+                                vc2 = struct.unpack_from('<I', orig_primary, off + 8*4)[0]
+                                vc3 = struct.unpack_from('<I', orig_primary, off + 11*4)[0]
+                                if vc == vc2 == vc3 and vc > 0:
+                                    block_count += 1
                         
-                        if not patched:
+                        try:
+                            if block_count > 1:
+                                # Multi-submesh prop model!
+                                submesh_list = mesh_from_blender_object(
+                                    obj, apply_transforms=True, split_by_material=True)
+                                from .encode import encode_primary_described_multi_submesh_replace
+                                gpu_data, primary_data = encode_primary_described_multi_submesh_replace(
+                                    orig_gpu, orig_primary,
+                                    submesh_list,
+                                    stream0_stride=s0_stride,
+                                    compute_normals=cn
+                                )
+                                self.report({'INFO'}, f"Auto-detected multi-submesh prop ({block_count} submeshes).")
+                            else:
+                                # Single-submesh hero/cosmetic model
+                                from .encode import encode_primary_described_full_replace
+                                gpu_data, primary_data = encode_primary_described_full_replace(
+                                    orig_gpu, orig_primary,
+                                    verts, faces, uvs=uvs,
+                                    stream0_stride=s0_stride,
+                                    compute_normals=cn
+                                )
+                            
+                            self._write_gpu(gpu_path, gpu_data)
+                            with open(primary_path, 'wb') as f:
+                                f.write(primary_data)
+                            self.report({'INFO'}, f"Wrote rebuilt GPU and patched original Primary template in-place: {os.path.basename(primary_path)}")
+                            patched = True
+                        except Exception as e:
+                            self.report({'WARNING'}, f"Template-based replacement failed: {e}. Falling back to standard export.")
+                
+                if not patched:
+                    gpu_data, primary_data = encode_primary_described(
+                        verts, faces, uvs=uvs, stream0_stride=s0_stride, compute_normals=cn)
+                    self._write_gpu(gpu_path, gpu_data)
+                    if self.write_primary:
+                        ppath = self._primary_sibling_path(gpu_path)
+                        if ppath:
+                            os.makedirs(os.path.dirname(ppath), exist_ok=True)
                             with open(ppath, 'wb') as f:
                                 f.write(primary_data)
-                            self.report({'INFO'}, f"Wrote clean Primary descriptor to {os.path.basename(ppath)}")
-                        
-                        self.report({'INFO'},
-                            f"{obj.name}: {len(verts)}v {len(faces)}f → "
-                            f"GPU + Primary written [primary_described]")
+                            self.report({'INFO'}, f"Wrote rebuilt GPU and clean 64-byte Primary descriptor: {os.path.basename(ppath)}")
+                        else:
+                            self.report({'WARNING'}, "Could not determine Primary path from GPU path. Primary skipped.")
                     else:
-                        self.report({'WARNING'},
-                            "Could not determine Primary path from GPU path. "
-                            "GPU written; Primary skipped. "
-                            "Expected layout: …/GPU/<family>/<hash>")
-                else:
-                    self._report_ok(obj.name, verts, faces, out_path)
+                        self._report_ok(obj.name, verts, faces, gpu_path)
+
+            elif self.encode_mode == 'primary_described_patch':
+                gpu_path = out_path
+                from .primary import _find_primary_path
+                primary_path = _find_primary_path(gpu_path)
+                
+                if not primary_path or not os.path.exists(primary_path):
+                    self.report({'ERROR'}, "Could not locate sibling Primary file via auto-discovery. "
+                                           "Ensure the original Primary file is in the corresponding sibling hash directory.")
+                    return {'CANCELLED'}
+                
+                if not os.path.exists(gpu_path):
+                    self.report({'ERROR'}, f"Original GPU file not found: {gpu_path}")
+                    return {'CANCELLED'}
+                
+                with open(gpu_path, 'rb') as f:
+                    orig_gpu = f.read()
+                with open(primary_path, 'rb') as f:
+                    orig_primary = f.read()
+                
+                from .encode import patch_primary_described_positions
+                try:
+                    patched_gpu, _ = patch_primary_described_positions(
+                        orig_gpu, orig_primary,
+                        scale_x=self.scale_x,
+                        scale_y=self.scale_y,
+                        scale_z=self.scale_z
+                    )
+                except ValueError as e:
+                    self.report({'ERROR'}, f"In-place patch failed: {e}")
+                    return {'CANCELLED'}
+                
+                self._write_gpu(gpu_path, patched_gpu)
+                self.report({'INFO'}, f"Surgically scaled vertex positions in {os.path.basename(gpu_path)}. "
+                                      f"Primary file remained untouched.")
 
             elif self.encode_mode == 'cgml':
                 gpu_data = encode_cgml(submeshes, compute_normals=cn)
                 self._write_gpu(out_path, gpu_data)
-                total_v = sum(len(v) for v, _ in submeshes)
-                total_f = sum(len(f) for _, f in submeshes)
+                total_v = sum(len(v) for v, _, _ in submeshes)
+                total_f = sum(len(f) for _, f, _ in submeshes)
                 self.report({'INFO'},
                     f"{obj.name}: {len(submeshes)} submesh(es) "
                     f"{total_v}v {total_f}f → {os.path.basename(out_path)} [cgml]")
@@ -509,13 +551,22 @@ class EVR_OT_ExportMesh(Operator, ExportHelper):
         grandparent = os.path.dirname(parent)
         ggp = os.path.dirname(grandparent)
 
-        # 1. Flat hash layout: any/e7a8ab5ceaef49cb/fname -> any/37102e4b27955a14/fname
-        candidate1 = os.path.join(grandparent, "37102e4b27955a14", fname)
+        gpu_to_primary = {
+            "e7a8ab5ceaef49cb": "37102e4b27955a14",
+            "e642bfb1abcf76df": "4e426f88c1b5d7ac",
+            "CGMeshListResource": "CGMeshListResource",
+            "CGInstancedModelResource": "CGInstancedModelResource",
+        }
+        parent_folder = os.path.basename(parent)
+        primary_folder = gpu_to_primary.get(parent_folder, "37102e4b27955a14")
+
+        # 1. Flat hash layout: any/parent/fname -> any/sibling/fname
+        candidate1 = os.path.join(grandparent, primary_folder, fname)
         if os.path.isdir(os.path.dirname(candidate1)):
             return candidate1
 
-        # 2. Nested hash layout: any/GPU/e7a8ab5ceaef49cb/fname -> any/Primary/37102e4b27955a14/fname
-        candidate2 = os.path.join(ggp, "Primary", "37102e4b27955a14", fname)
+        # 2. Nested hash layout: any/GPU/parent/fname -> any/Primary/sibling/fname
+        candidate2 = os.path.join(ggp, "Primary", primary_folder, fname)
         if os.path.isdir(os.path.dirname(candidate2)) or os.path.basename(grandparent) == "GPU":
             return candidate2
 
@@ -542,8 +593,13 @@ class EVR_OT_ExportMesh(Operator, ExportHelper):
         layout.prop(self, "encode_mode", text="")
 
         layout.separator()
-        layout.prop(self, "compute_normals")
-        layout.prop(self, "scale")
+        if self.encode_mode == 'primary_described_patch':
+            layout.prop(self, "scale_x")
+            layout.prop(self, "scale_y")
+            layout.prop(self, "scale_z")
+        else:
+            layout.prop(self, "compute_normals")
+            layout.prop(self, "scale")
 
         if self.encode_mode == 'primary_described':
             layout.separator()

@@ -90,8 +90,8 @@ def _find_prefix_pair_run(data, stride, prefix_pairs, min_records=16):
 
 
 def _extract_submesh(data, s0_start, Nv, s0_stride):
-    """Given a validated stream-0 run, extract verts + index buffer.
-    Returns (verts, faces) or None if stream-1 XYZ is invalid."""
+    """Given a validated stream-0 run, extract verts, faces + UVs.
+    Returns (verts, faces, uvs) or None if stream-1 XYZ is invalid."""
     n = len(data)
     s1_start = s0_start + Nv * s0_stride
     s1_end = s1_start + Nv * 28
@@ -122,7 +122,18 @@ def _extract_submesh(data, s0_start, Nv, s0_stride):
         i0, i1, i2 = struct.unpack_from("<HHH", data, ib_start + k * 2)
         faces.append((i0, i1, i2))
 
-    return verts, faces
+    uvs = []
+    if s0_stride >= 16:
+        for j in range(Nv):
+            s0_off = s0_start + j * s0_stride
+            u, v = struct.unpack_from("<ff", data, s0_off + 8)
+            if not (math.isfinite(u) and math.isfinite(v)):
+                u, v = 0.0, 0.0
+            uvs.append((u, v))
+    else:
+        uvs = [(0.0, 0.0)] * Nv
+
+    return verts, faces, uvs
 
 
 # ============================================================
@@ -144,7 +155,7 @@ def _extract_primary_described_cimr_mesh(gpu_data, primary_data):
         return struct.unpack_from("<I", meta, off)[0]
 
     max_block_vc = 0
-    for _off in range(0, n_meta - 0x40, 4):
+    for _off in range(0, n_meta - 0x40 + 1, 4):
         if u32(_off) != 0x0B:
             continue
         _vc = u32(_off + 7 * 4)
@@ -153,7 +164,7 @@ def _extract_primary_described_cimr_mesh(gpu_data, primary_data):
                 max_block_vc = _vc
 
     best = None
-    for off in range(0, n_meta - 0x40, 4):
+    for off in range(0, n_meta - 0x40 + 1, 4):
         if u32(off) != 0x0B:
             continue
 
@@ -229,14 +240,28 @@ def _extract_primary_described_cimr_mesh(gpu_data, primary_data):
             if len(faces) < 24:
                 continue
 
-            candidate = (len(faces), vertex_count, -pos_off, verts, faces)
+            # Extract UVs from Stream-0
+            s0_start = base_offset
+            s0_stride = stream0_size // vertex_count
+            uvs = []
+            if s0_stride >= 16:
+                for j in range(vertex_count):
+                    s0_off = s0_start + j * s0_stride
+                    u, v = struct.unpack_from("<ff", gpu_data, s0_off + 8)
+                    if not (math.isfinite(u) and math.isfinite(v)):
+                        u, v = 0.0, 0.0
+                    uvs.append((u, v))
+            else:
+                uvs = [(0.0, 0.0)] * vertex_count
+
+            candidate = (len(faces), vertex_count, -pos_off, verts, faces, uvs)
             if best is None or candidate[:3] > best[:3]:
                 best = candidate
             break
 
     if best is None:
         return []
-    return [(best[3], best[4])]
+    return [(best[3], best[4], best[5])]
 
 
 def _extract_hero_cimr_mesh(gpu_data, primary_data):
@@ -256,7 +281,7 @@ def _extract_hero_cimr_mesh(gpu_data, primary_data):
 
     best = None
 
-    for off in range(0, n_meta - 0x40, 4):
+    for off in range(0, n_meta - 0x40 + 1, 4):
         if u32(off) != 0x0B:
             continue
 
@@ -319,17 +344,28 @@ def _extract_hero_cimr_mesh(gpu_data, primary_data):
                 if i0 == i1 or i1 == i2 or i0 == i2:
                     continue
                 faces.append((i0, i1, i2))
-            if not faces:
-                continue
+            # Extract UVs from Stream-0
+            s0_start = base_offset
+            s0_stride = stream0_size // vertex_count
+            uvs = []
+            if s0_stride >= 16:
+                for j in range(vertex_count):
+                    s0_off = s0_start + j * s0_stride
+                    u, v = struct.unpack_from("<ff", gpu_data, s0_off + 8)
+                    if not (math.isfinite(u) and math.isfinite(v)):
+                        u, v = 0.0, 0.0
+                    uvs.append((u, v))
+            else:
+                uvs = [(0.0, 0.0)] * vertex_count
 
-            candidate = (vertex_count, len(faces), -pos_off, verts, faces)
+            candidate = (vertex_count, len(faces), -pos_off, verts, faces, uvs)
             if best is None or candidate[:3] > best[:3]:
                 best = candidate
             break
 
     if best is None:
         return []
-    return [(best[3], best[4])]
+    return [(best[3], best[4], best[5])]
 
 
 def _extract_crossref_ib_cimr_mesh(gpu_data, primary_data):
@@ -362,7 +398,7 @@ def _extract_crossref_ib_cimr_mesh(gpu_data, primary_data):
         return struct.unpack_from("<I", meta, off)[0]
 
     blocks = []
-    for off in range(0, n_meta - 0x40, 4):
+    for off in range(0, n_meta - 0x40 + 1, 4):
         if u32(off) != 0x0B:
             continue
         vals = [u32(off + i * 4) for i in range(16)]
@@ -433,23 +469,37 @@ def _extract_crossref_ib_cimr_mesh(gpu_data, primary_data):
                         continue
                     faces.append((i0, i1, i2))
 
+                # Extract UVs from Stream-0
+                s0_stride = s0_1 // vc1
+                uvs = []
+                if s0_stride >= 16:
+                    for j in range(effective_vc):
+                        s0_off = j * s0_stride
+                        u, v = struct.unpack_from("<ff", gpu_data, s0_off + 8)
+                        if not (math.isfinite(u) and math.isfinite(v)):
+                            u, v = 0.0, 0.0
+                        uvs.append((u, v))
+                else:
+                    uvs = [(0.0, 0.0)] * effective_vc
+
                 last_v = verts[effective_vc - 1]
                 if all(abs(c) < 1e-38 for c in last_v):
                     null_idx = effective_vc - 1
                     faces = [f for f in faces if null_idx not in f]
                     verts = verts[:null_idx]
+                    uvs = uvs[:null_idx]
 
                 if not faces:
                     continue
 
-                candidate = (len(faces), effective_vc, -pos_off, verts, faces)
+                candidate = (len(faces), effective_vc, -pos_off, verts, faces, uvs)
                 if best is None or candidate[:3] > best[:3]:
                     best = candidate
                 break
 
     if best is None:
         return []
-    return [(best[3], best[4])]
+    return [(best[3], best[4], best[5])]
 
 
 # ============================================================
@@ -472,6 +522,7 @@ def _extract_cgml_ranges(gpu_data, base_offset, stream0_size, vertex_count,
         if abs(x) > 50000 or abs(y) > 50000 or abs(z) > 50000:
             return None
         verts.append((x, y, z))
+
     faces = []
     for k in range(0, index_count - index_count % 3, 3):
         i0, i1, i2 = struct.unpack_from("<HHH", gpu_data, ib_start + k * 2)
@@ -480,7 +531,20 @@ def _extract_cgml_ranges(gpu_data, base_offset, stream0_size, vertex_count,
         faces.append((i0, i1, i2))
     if not faces:
         return None
-    return verts, faces
+
+    s0_stride = stream0_size // vertex_count if vertex_count else 16
+    uvs = []
+    if s0_stride >= 16:
+        for j in range(vertex_count):
+            s0_off = base_offset + j * s0_stride
+            u, v = struct.unpack_from("<ff", gpu_data, s0_off + 8)
+            if not (math.isfinite(u) and math.isfinite(v)):
+                u, v = 0.0, 0.0
+            uvs.append((u, v))
+    else:
+        uvs = [(0.0, 0.0)] * vertex_count
+
+    return verts, faces, uvs
 
 
 def _decode_compact_cgml(meta, gpu_data):
@@ -1251,8 +1315,8 @@ def extract_mesh(gpu_filepath, primary_data=None, auto_find_primary=True):
 
         crossref = _extract_crossref_ib_cimr_mesh(data, primary_data)
         hero = _extract_hero_cimr_mesh(data, primary_data)
-        crossref_tris = sum(len(f) for _, f in crossref)
-        hero_tris = sum(len(f) for _, f in hero)
+        crossref_tris = sum(len(sub[1]) for sub in crossref)
+        hero_tris = sum(len(sub[1]) for sub in hero)
         if crossref_tris > hero_tris and crossref:
             return crossref, "crossref_ib"
         if hero:
@@ -1324,11 +1388,11 @@ def extract_mesh(gpu_filepath, primary_data=None, auto_find_primary=True):
 
     any_s16 = _extract_any_color_s16_mesh(data)
     leading_s16 = _extract_leading_any_color_s16_mesh(data)
-    best_s16 = (any_s16 if sum(len(f) for _, f in any_s16) >=
-                sum(len(f) for _, f in leading_s16) else leading_s16)
+    best_s16 = (any_s16 if sum(len(sub[1]) for sub in any_s16) >=
+                sum(len(sub[1]) for sub in leading_s16) else leading_s16)
     if best_s16:
-        s16_tris = sum(len(f) for _, f in best_s16)
-        cur_tris = sum(len(f) for _, f in submeshes)
+        s16_tris = sum(len(sub[1]) for sub in best_s16)
+        cur_tris = sum(len(sub[1]) for sub in submeshes)
         if s16_tris > cur_tris:
             submeshes = best_s16
 

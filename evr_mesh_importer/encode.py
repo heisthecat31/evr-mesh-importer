@@ -121,25 +121,28 @@ def _make_tangent_frame(normal):
 # Stream packers
 # ============================================================
 
-def _pack_stream0_s16(vertex_count):
+def _pack_stream0_s16(vertex_count, uvs=None):
     """
     Stream-0 stride-16: most common CIMR pattern.
-    Records are 0xFFFFFFFF 0x00000000 0x00000000 0x00000000
-    The heuristic path detects these via _find_runs (8-byte seed repeating).
+    Records are 0xFFFFFFFF 0x00000000 [UV.u:float32] [UV.v:float32]
     """
-    record = struct.pack('<IIII', 0xFFFFFFFF, 0x00000000, 0x00000000, 0x00000000)
-    return record * vertex_count
+    out = bytearray()
+    for i in range(vertex_count):
+        u, v = uvs[i] if uvs else (0.0, 0.0)
+        out += struct.pack('<IIff', 0xFFFFFFFF, 0x00000000, u, v)
+    return bytes(out)
 
 
-def _pack_stream0_s20_white(vertex_count):
+def _pack_stream0_s20_white(vertex_count, uvs=None):
     """
     Stream-0 stride-20: vertex-colored variant, all-white (0xFFFFFFFF RGBA).
-    Bytes[3:7] = 0xFFFFFFFF triggers _find_vertex_colored_runs.
-    Layout per record: [R:u8][G:u8][B:u8][A:u8=FF][FF:u8][FF:u8][FF:u8][FF:u8] + 12 zeroed
-    We emit a clean white record: 0xFFFFFFFF 0xFFFFFFFF 0x00000000 0x00000000 0x00000000
+    Layout: 0xFF000000 0xFFFFFFFF [UV.u:float32] [UV.v:float32] 0x00000000
     """
-    record = struct.pack('<IIIII', 0xFFFFFFFF, 0xFFFFFFFF, 0, 0, 0)
-    return record * vertex_count
+    out = bytearray()
+    for i in range(vertex_count):
+        u, v = uvs[i] if uvs else (0.0, 0.0)
+        out += struct.pack('<IIffI', 0xFF000000, 0xFFFFFFFF, u, v, 0)
+    return bytes(out)
 
 
 def _pack_stream0_s28_ff(vertex_count):
@@ -150,6 +153,33 @@ def _pack_stream0_s28_ff(vertex_count):
     """
     record = struct.pack('<II', 0xFFFFFFFF, 0xFFFFFFFF) + b'\x00' * 20
     return record * vertex_count
+
+
+def _pack_stream0_dynamic(vertex_count, stride, uvs=None):
+    """
+    Dynamically pack stream-0 to match the required stride perfectly.
+    Supports standard 16, 20, and extended strides (e.g. 44 for props).
+    """
+    if stride == 16:
+        return _pack_stream0_s16(vertex_count, uvs=uvs)
+    elif stride == 20:
+        return _pack_stream0_s20_white(vertex_count, uvs=uvs)
+
+    out = bytearray()
+    for i in range(vertex_count):
+        u, v = uvs[i] if uvs else (0.0, 0.0)
+        # Start with standard double-color prefix and UVs
+        record = bytearray(struct.pack('<IIff', 0xFF000000, 0xFF000000, u, v))
+        # If there's space, repeat UVs (common in 44-stride props)
+        if stride >= 24:
+            record += struct.pack('<ff', u, v)
+        # Pad the rest of the record to match stride
+        if len(record) < stride:
+            record += b'\x00' * (stride - len(record))
+        elif len(record) > stride:
+            record = record[:stride]
+        out += record
+    return bytes(out)
 
 
 def _pack_stream1_with_normals(verts, normals):
@@ -223,7 +253,7 @@ def _pack_index_buffer_u32(faces):
 # Validation helpers
 # ============================================================
 
-def _validate_mesh(verts, faces, label="mesh"):
+def _validate_mesh(verts, faces, label="mesh", allow_degenerate=False):
     """Raise ValueError with a clear message if the mesh is invalid."""
     nv = len(verts)
     if nv == 0:
@@ -239,7 +269,7 @@ def _validate_mesh(verts, faces, label="mesh"):
     if bad:
         raise ValueError(f"{label}: face {bad[0][0]} references index >= {nv}")
     degenerate = sum(1 for f in faces if f[0]==f[1] or f[1]==f[2] or f[0]==f[2])
-    if degenerate == len(faces):
+    if degenerate == len(faces) and not allow_degenerate:
         raise ValueError(f"{label}: all {len(faces)} faces are degenerate")
 
 
@@ -247,7 +277,7 @@ def _validate_mesh(verts, faces, label="mesh"):
 # Public encoders
 # ============================================================
 
-def encode_heuristic_s16(verts, faces, compute_normals=True):
+def encode_heuristic_s16(verts, faces, uvs=None, compute_normals=True):
     """
     Encode a mesh using the heuristic stride-16 stream-0 layout.
 
@@ -262,6 +292,7 @@ def encode_heuristic_s16(verts, faces, compute_normals=True):
     Args:
         verts:           [(x, y, z), ...]
         faces:           [(i0, i1, i2), ...]  — must all be < len(verts)
+        uvs:             optional [(u, v), ...] UV coordinates
         compute_normals: if True, compute smooth normals from topology.
                          if False, stream-1 normals are zeroed (safe for
                          geometry testing but will look flat/wrong in-game).
@@ -270,7 +301,7 @@ def encode_heuristic_s16(verts, faces, compute_normals=True):
         bytes — the complete GPU binary to write over the original file.
     """
     _validate_mesh(verts, faces, "heuristic_s16")
-    s0 = _pack_stream0_s16(len(verts))
+    s0 = _pack_stream0_s16(len(verts), uvs=uvs)
     if compute_normals:
         normals = _compute_smooth_normals(verts, faces)
         s1 = _pack_stream1_with_normals(verts, normals)
@@ -280,7 +311,7 @@ def encode_heuristic_s16(verts, faces, compute_normals=True):
     return s0 + s1 + ib
 
 
-def encode_heuristic_s20(verts, faces, compute_normals=True):
+def encode_heuristic_s20(verts, faces, uvs=None, compute_normals=True):
     """
     Encode using the heuristic stride-20 stream-0 layout (vertex-colored family).
 
@@ -291,7 +322,7 @@ def encode_heuristic_s20(verts, faces, compute_normals=True):
         bytes — the complete GPU binary.
     """
     _validate_mesh(verts, faces, "heuristic_s20")
-    s0 = _pack_stream0_s20_white(len(verts))
+    s0 = _pack_stream0_s20_white(len(verts), uvs=uvs)
     if compute_normals:
         normals = _compute_smooth_normals(verts, faces)
         s1 = _pack_stream1_with_normals(verts, normals)
@@ -325,7 +356,7 @@ def encode_heuristic_dual28(verts, faces, compute_normals=True):
     return s0 + s1 + ib
 
 
-def encode_primary_described(verts, faces, stream0_stride=16, compute_normals=True):
+def encode_primary_described(verts, faces, uvs=None, stream0_stride=16, compute_normals=True):
     """
     Encode a mesh in the primary_described layout and produce a matching
     Primary binary. Both files must be written for the game to load correctly.
@@ -337,6 +368,7 @@ def encode_primary_described(verts, faces, stream0_stride=16, compute_normals=Tr
     Args:
         verts:           [(x, y, z), ...]
         faces:           [(i0, i1, i2), ...]
+        uvs:             optional [(u, v), ...] UV coordinates
         stream0_stride:  16 or 20 — must match the original file's s0_stride.
         compute_normals: pack smooth normals into stream-1.
 
@@ -350,9 +382,9 @@ def encode_primary_described(verts, faces, stream0_stride=16, compute_normals=Tr
     nt = len(faces)
 
     if stream0_stride == 16:
-        s0 = _pack_stream0_s16(nv)
+        s0 = _pack_stream0_s16(nv, uvs=uvs)
     else:
-        s0 = _pack_stream0_s20_white(nv)
+        s0 = _pack_stream0_s20_white(nv, uvs=uvs)
 
     if compute_normals:
         normals = _compute_smooth_normals(verts, faces)
@@ -402,16 +434,21 @@ def encode_cgml(submesh_list, compute_normals=True):
     See encode_cgml_primary() for that.
 
     Args:
-        submesh_list:    [(verts, faces), ...]
+        submesh_list:    [(verts, faces, uvs), ...] or [(verts, faces), ...]
         compute_normals: pack smooth normals.
 
     Returns:
         bytes — concatenated GPU binary for all submeshes.
     """
     out = bytearray()
-    for i, (verts, faces) in enumerate(submesh_list):
+    for i, sub in enumerate(submesh_list):
+        if len(sub) == 3:
+            verts, faces, uvs = sub
+        else:
+            verts, faces = sub
+            uvs = None
         _validate_mesh(verts, faces, f"cgml submesh {i}")
-        out += encode_heuristic_s16(verts, faces, compute_normals=compute_normals)
+        out += encode_heuristic_s16(verts, faces, uvs=uvs, compute_normals=compute_normals)
     return bytes(out)
 
 
@@ -450,36 +487,56 @@ def mesh_from_blender_object(obj, apply_transforms=True, split_by_material=False
     # Triangulate in place — required for triangle-list IB
     bmesh.ops.triangulate(bm, faces=bm.faces[:])
 
+    # Try to get active UV layer
+    uv_layer = bm.loops.layers.uv.active
+
     if not split_by_material:
         verts = [(v.co.x, v.co.y, v.co.z) for v in bm.verts]
         faces = [(f.verts[0].index, f.verts[1].index, f.verts[2].index)
                  for f in bm.faces]
+        
+        uvs = []
+        if uv_layer:
+            for v in bm.verts:
+                uv = (0.0, 0.0)
+                if v.link_loops:
+                    loop = v.link_loops[0]
+                    uv = (loop[uv_layer].uv.x, loop[uv_layer].uv.y)
+                uvs.append(uv)
+        else:
+            uvs = [(0.0, 0.0)] * len(verts)
+
         bm.free()
         if len(verts) > 65535:
             raise ValueError(
                 f"Mesh '{obj.name}' has {len(verts)} vertices. "
                 "Decimate below 65536 before exporting."
             )
-        return verts, faces
+        return verts, faces, uvs
 
     # Split by material index
     n_mats = max(len(obj.material_slots), 1)
     vert_maps = [dict() for _ in range(n_mats)]
     vert_lists = [[] for _ in range(n_mats)]
     face_lists = [[] for _ in range(n_mats)]
+    uv_lists = [[] for _ in range(n_mats)]
 
     for face in bm.faces:
         mat_idx = min(face.material_index, n_mats - 1)
         vm = vert_maps[mat_idx]
         vl = vert_lists[mat_idx]
         fl = face_lists[mat_idx]
+        ul = uv_lists[mat_idx]
 
         tri = []
-        for v in face.verts:
+        for loop in face.loops:
+            v = loop.vert
             key = v.index
             if key not in vm:
                 vm[key] = len(vl)
                 vl.append((v.co.x, v.co.y, v.co.z))
+                uv = (loop[uv_layer].uv.x, loop[uv_layer].uv.y) if uv_layer else (0.0, 0.0)
+                ul.append(uv)
             tri.append(vm[key])
         fl.append(tuple(tri))
 
@@ -493,5 +550,401 @@ def mesh_from_blender_object(obj, apply_transforms=True, split_by_material=False
                     f"Material slot {i} of '{obj.name}' has "
                     f"{len(vert_lists[i])} vertices. Decimate below 65536."
                 )
-            result.append((vert_lists[i], face_lists[i]))
+            result.append((vert_lists[i], face_lists[i], uv_lists[i]))
     return result
+
+
+def encode_primary_described_full_replace(
+        original_gpu_bytes,
+        original_primary_bytes,
+        verts,
+        faces,
+        uvs=None,
+        stream0_stride=None,
+        compute_normals=True):
+    """
+    Full mesh replacement for primary_described files.
+
+    The encoder's standalone encode_primary_described() writes only a 64-byte
+    Primary (16 × uint32). The real Primary binary is larger — the game reads
+    additional sections (bounding box, LOD tables, collision, etc.) from the
+    same Primary stream after the descriptor block. Writing a truncated Primary
+    causes "Offset is past the end of the stream" in cmemstream.cpp.
+
+    This function instead:
+      1. Builds the new GPU binary normally (s0 + s1 + ib).
+      2. Takes the ORIGINAL Primary binary as a template.
+      3. Patches ONLY the six descriptor fields the decoder uses
+         (stream0_size, vertex_count ×3, index_offset, index_count).
+      4. Returns the new GPU bytes and the patched full-length Primary bytes.
+
+    Both returned binaries must be written back to disk. The Primary will be
+    the same size as the original — all trailing game data is preserved.
+
+    Args:
+        original_gpu_bytes:     bytes — original GPU file (used only for reference,
+                                not written back; the new GPU is built from scratch).
+        original_primary_bytes: bytes — original Primary file (template).
+        verts:                  [(x, y, z), ...]
+        faces:                  [(i0, i1, i2), ...]
+        uvs:                    optional [(u, v), ...] UV coordinates
+        stream0_stride:         optional 16 or 20 (auto-detected if None).
+        compute_normals:        pack smooth normals into stream-1.
+
+    Returns:
+        (new_gpu_bytes: bytes, patched_primary_bytes: bytes)
+    """
+    import struct
+
+    _validate_mesh(verts, faces, "primary_described_full_replace")
+
+    # Require the original Primary to be at least 64 bytes (the descriptor block).
+    if len(original_primary_bytes) < 64:
+        raise ValueError(
+            f"Original Primary is only {len(original_primary_bytes)} bytes. "
+            "Need at least 64 bytes (the 16-dword descriptor block)."
+        )
+
+    # Find the maximum original vertex count across all blocks in the template,
+    # and automatically detect stream0_stride from the first valid block!
+    max_orig_vc = 0
+    detected_stride = None
+    n_meta = len(original_primary_bytes)
+    for off in range(0, n_meta - 60, 4):
+        val = struct.unpack_from('<I', original_primary_bytes, off)[0]
+        if val == 0x0B:
+            vc = struct.unpack_from('<I', original_primary_bytes, off + 7*4)[0]
+            vc2 = struct.unpack_from('<I', original_primary_bytes, off + 8*4)[0]
+            vc3 = struct.unpack_from('<I', original_primary_bytes, off + 11*4)[0]
+            if vc == vc2 == vc3 and vc > 0:
+                if vc > max_orig_vc:
+                    max_orig_vc = vc
+                if detected_stride is None:
+                    s0_sz = struct.unpack_from('<I', original_primary_bytes, off + 4*4)[0]
+                    if s0_sz % vc == 0:
+                        cand = s0_sz // vc
+                        if 12 <= cand <= 64:
+                            detected_stride = cand
+
+    # Default/fallback for stride
+    if stream0_stride is None:
+        stream0_stride = detected_stride if detected_stride is not None else 16
+
+    # If the custom mesh has fewer vertices than expected by the shared index buffer,
+    # we automatically pad the vertex buffer to satisfy shared LOD index buffer safety checks.
+    real_nv = len(verts)
+    if max_orig_vc > real_nv:
+        padding_count = max_orig_vc - real_nv
+        last_v = verts[-1] if verts else (0.0, 0.0, 0.0)
+        verts = list(verts) + [last_v] * padding_count
+        if uvs:
+            last_uv = uvs[-1] if uvs else (0.0, 0.0)
+            uvs = list(uvs) + [last_uv] * padding_count
+
+    nv = len(verts)
+    nt = len(faces)
+
+    # Build new GPU binary (same as standalone encoder).
+    s0 = _pack_stream0_dynamic(nv, stream0_stride, uvs=uvs)
+
+    if compute_normals:
+        normals = _compute_smooth_normals(verts, faces)
+        s1 = _pack_stream1_with_normals(verts, normals)
+    else:
+        s1 = _pack_stream1_zeroed(verts)
+
+    ib = _pack_index_buffer_u16(faces)
+    new_gpu = s0 + s1 + ib
+
+    # Pad the GPU binary with trailing zeros to match the exact original file size,
+    # satisfying the game's manifest/archive index metadata and preventing stream out-of-bounds.
+    orig_gpu_size = len(original_gpu_bytes)
+    if len(new_gpu) < orig_gpu_size:
+        padding = orig_gpu_size - len(new_gpu)
+        new_gpu = new_gpu + b'\x00' * padding
+
+    stream0_size  = nv * stream0_stride
+    index_offset  = stream0_size + nv * 28   # s1 immediately follows s0
+    index_count   = nt * 3                   # uint16 indices
+
+    # Patch descriptor fields in ALL blocks in the original Primary template.
+    # For linear blocks (rk == 2) we patch real index offsets and counts.
+    # For cross-reference blocks (rk != 2) we update stream0_size and vertex_count but preserve their cross-ref index IDs.
+    patched_primary = bytearray(original_primary_bytes)
+    n_meta = len(patched_primary)
+    block_count = 0
+    for off in range(0, n_meta - 60, 4):
+        val = struct.unpack_from('<I', patched_primary, off)[0]
+        if val == 0x0B:
+            vc = struct.unpack_from('<I', patched_primary, off + 7*4)[0]
+            vc2 = struct.unpack_from('<I', patched_primary, off + 8*4)[0]
+            vc3 = struct.unpack_from('<I', patched_primary, off + 11*4)[0]
+            if vc == vc2 == vc3 and vc > 0:
+                rk = struct.unpack_from('<I', patched_primary, off + 14*4)[0]
+                if rk == 2:
+                    # Linear block: update everything to new real values
+                    for field_index, value in [
+                        (2,  0),              # stream0 starts at byte 0
+                        (4,  stream0_size),
+                        (7,  nv),
+                        (8,  nv),
+                        (11, nv),
+                        (12, index_offset),
+                        (13, index_count),
+                    ]:
+                        struct.pack_into('<I', patched_primary, off + field_index * 4, value)
+                else:
+                    # Cross-reference block: update stream0_size and vertex_count, keeping index_offset/index_count IDs
+                    for field_index, value in [
+                        (2,  0),              # stream0 starts at byte 0
+                        (4,  stream0_size),
+                        (7,  nv),
+                        (8,  nv),
+                        (11, nv),
+                    ]:
+                        struct.pack_into('<I', patched_primary, off + field_index * 4, value)
+                block_count += 1
+
+    return new_gpu, bytes(patched_primary)
+
+
+def encode_primary_described_multi_submesh_replace(
+        original_gpu_bytes,
+        original_primary_bytes,
+        submesh_list,
+        stream0_stride=None,
+        compute_normals=True):
+    """
+    Multi-submesh replacement for environment prop models (CGMeshListResource).
+    
+    This function:
+      1. Builds independent concatenated GPU submesh binaries (s0 + s1 + ib) for each submesh.
+      2. Maps and patches each submesh's offset, count, and size individually in the Primary template.
+      3. Safely preserves all cross-reference LOD index buffer IDs and shadow geometry blocks.
+      4. Pads the final merged GPU binary to match the original size.
+    """
+    import struct
+
+    # Count actual rendering blocks in the original template to know how many submeshes are expected
+    expected_blocks = []
+    n_meta = len(original_primary_bytes)
+    for off in range(0, n_meta - 60, 4):
+        val = struct.unpack_from('<I', original_primary_bytes, off)[0]
+        if val == 0x0B:
+            vc = struct.unpack_from('<I', original_primary_bytes, off + 7*4)[0]
+            vc2 = struct.unpack_from('<I', original_primary_bytes, off + 8*4)[0]
+            vc3 = struct.unpack_from('<I', original_primary_bytes, off + 11*4)[0]
+            if vc == vc2 == vc3 and vc > 0:
+                s0_sz = struct.unpack_from('<I', original_primary_bytes, off + 4*4)[0]
+                rk = struct.unpack_from('<I', original_primary_bytes, off + 14*4)[0]
+                if rk == 2:
+                    ib_cnt = struct.unpack_from('<I', original_primary_bytes, off + 13*4)[0]
+                    fc = ib_cnt // 3
+                else:
+                    fc = vc
+                expected_blocks.append((off, vc, s0_sz, fc))
+
+    if not expected_blocks:
+        raise ValueError("No valid rendering blocks found in the original Primary template.")
+
+    # Determine stride
+    if stream0_stride is None:
+        detected_stride = None
+        for off, vc, s0_sz, fc in expected_blocks:
+            if s0_sz % vc == 0:
+                cand = s0_sz // vc
+                if 12 <= cand <= 64:
+                    detected_stride = cand
+                    break
+        stream0_stride = detected_stride if detected_stride is not None else 16
+
+    # Match Blender submeshes to the expected blocks.
+    # If the user has fewer submeshes, we pad extra submeshes with clean dummy placeholder points.
+    processed_subs = []
+    for idx in range(len(expected_blocks)):
+        off, orig_vc, s0_sz, orig_fc = expected_blocks[idx]
+        if idx < len(submesh_list):
+            sub = submesh_list[idx]
+            if len(sub) == 3:
+                verts, faces, uvs = sub
+            else:
+                verts, faces = sub
+                uvs = None
+                
+            # If the custom submesh has fewer vertices than expected by the LOD template,
+            # we pad it to ensure safety checks are satisfied.
+            if orig_vc > len(verts):
+                padding_count = orig_vc - len(verts)
+                last_v = verts[-1] if verts else (0.0, 0.0, 0.0)
+                verts = list(verts) + [last_v] * padding_count
+                if uvs:
+                    last_uv = uvs[-1] if uvs else (0.0, 0.0)
+                    uvs = list(uvs) + [last_uv] * padding_count
+        else:
+            # Smart Dummy Padding! Completely collapses extra original submeshes into
+            # invisible points at the origin that exactly match expected counts.
+            # Using all-zero degenerate triangles which the GPU silently discards at rendering time!
+            verts = [(0.0, 0.0, 0.0)] * orig_vc
+            faces = [(0, 0, 0)] * orig_fc
+            uvs = [(0.0, 0.0)] * orig_vc
+            
+        processed_subs.append((verts, faces, uvs))
+
+    new_gpu = bytearray()
+    submesh_offsets = []
+    current_offset = 0
+
+    for idx, (verts, faces, uvs) in enumerate(processed_subs):
+        allow_degen = (idx >= len(submesh_list))
+        _validate_mesh(verts, faces, f"multi_submesh_replace submesh {idx}", allow_degenerate=allow_degen)
+        nv = len(verts)
+        nt = len(faces)
+
+        s0 = _pack_stream0_dynamic(nv, stream0_stride, uvs=uvs)
+        if compute_normals:
+            normals = _compute_smooth_normals(verts, faces)
+            s1 = _pack_stream1_with_normals(verts, normals)
+        else:
+            s1 = _pack_stream1_zeroed(verts)
+        ib = _pack_index_buffer_u16(faces)
+
+        sub_binary = s0 + s1 + ib
+
+        s0_start = current_offset
+        s0_size = len(s0)
+        s1_size = len(s1)
+        ib_offset = s0_start + s0_size + s1_size
+        ib_count = nt * 3
+
+        submesh_offsets.append((s0_start, s0_size, nv, ib_offset, ib_count))
+
+        new_gpu += sub_binary
+        current_offset += len(sub_binary)
+
+    # Pad GPU binary to original size
+    orig_gpu_size = len(original_gpu_bytes)
+    if len(new_gpu) < orig_gpu_size:
+        padding = orig_gpu_size - len(new_gpu)
+        new_gpu += b'\x00' * padding
+
+    # Patch Primary
+    patched_primary = bytearray(original_primary_bytes)
+    block_index = 0
+    for off in range(0, n_meta - 60, 4):
+        val = struct.unpack_from('<I', patched_primary, off)[0]
+        if val == 0x0B:
+            vc = struct.unpack_from('<I', patched_primary, off + 7*4)[0]
+            vc2 = struct.unpack_from('<I', patched_primary, off + 8*4)[0]
+            vc3 = struct.unpack_from('<I', patched_primary, off + 11*4)[0]
+            if vc == vc2 == vc3 and vc > 0:
+                if block_index < len(submesh_offsets):
+                    s0_start, s0_size, nv, ib_offset, ib_count = submesh_offsets[block_index]
+
+                    # Force ALL submeshes to be Linear rendering blocks (rk = 2)!
+                    # This ensures perfect DirectX buffer layout alignment (stride-16/24) and index buffers!
+                    target_rk = 2
+                    struct.pack_into('<I', patched_primary, off + 14*4, target_rk)
+
+                    fields = [
+                        (2, s0_start),
+                        (4, s0_size),
+                        (7, nv),
+                        (8, nv),
+                        (11, nv),
+                        (12, ib_offset),
+                        (13, ib_count),
+                    ]
+
+                    for field_index, value in fields:
+                        struct.pack_into('<I', patched_primary, off + field_index * 4, value)
+
+                    block_index += 1
+
+    return bytes(new_gpu), bytes(patched_primary)
+
+
+def patch_primary_described_positions(original_gpu_bytes, original_primary_bytes,
+                                       scale_x=1.0, scale_y=1.0, scale_z=1.0):
+    """
+    Scale vertex positions in-place without rebuilding the GPU binary.
+
+    For primary_described files, the game's resource manager reads buffer
+    offsets from the Primary file. If you rebuild the GPU binary from scratch
+    (via encode_primary_described), any file that has LOD data, shadow geometry,
+    or secondary vertex buffers after the main mesh will cause
+    'Offset is past end of stream' because the rebuilt binary is shorter.
+
+    This function instead:
+      1. Reads stream0_size and index_offset from the ORIGINAL Primary binary
+         to locate stream-1 (which contains the XYZ float32 positions)
+      2. Multiplies each vertex X/Y/Z by the given scale factors in-place.
+      3. Returns the modified GPU bytes at the EXACT same length as the original
+
+    The Primary binary is returned UNCHANGED because no offsets, counts,
+    or bounding-box fields need to change for a scale (the game
+    computes bounds at runtime from the vertex data).
+
+    Args:
+        original_gpu_bytes:     bytes — the original GPU file contents
+        original_primary_bytes: bytes — the original Primary file contents
+        scale_x, scale_y, scale_z: float scale multipliers per axis
+
+    Returns:
+        (patched_gpu_bytes, original_primary_bytes)
+    """
+    import struct
+
+    if len(original_primary_bytes) < 64:
+        raise ValueError(
+            f"Primary binary too short ({len(original_primary_bytes)} bytes); "
+            "expected at least 64 bytes (16 × uint32 descriptor)."
+        )
+
+    # Search for first 0x0B block to read stream0_size and vertex_count
+    stream0_size = None
+    vertex_count = None
+    
+    n_meta = len(original_primary_bytes)
+    for off in range(0, n_meta - 60, 4):
+        val = struct.unpack_from('<I', original_primary_bytes, off)[0]
+        if val == 0x0B:
+            vc = struct.unpack_from('<I', original_primary_bytes, off + 7*4)[0]
+            vc2 = struct.unpack_from('<I', original_primary_bytes, off + 8*4)[0]
+            vc3 = struct.unpack_from('<I', original_primary_bytes, off + 11*4)[0]
+            if vc == vc2 == vc3 and vc > 0:
+                fields = struct.unpack_from('<16I', original_primary_bytes, off)
+                stream0_size = fields[4]
+                vertex_count = fields[7]
+                break
+
+    if stream0_size is None or vertex_count is None:
+        # Fallback to absolute start of file
+        fields = struct.unpack_from('<16I', original_primary_bytes, 0)
+        stream0_size = fields[4]
+        vertex_count = fields[7]
+
+    # Validate that stream-1 fits inside the GPU binary
+    stream1_start = stream0_size
+    stream1_stride = 28         # always 28 in primary_described
+    stream1_end = stream1_start + vertex_count * stream1_stride
+
+    gpu = len(original_gpu_bytes)
+    if stream1_end > gpu:
+        raise ValueError(
+            f"Primary descriptor says stream-1 ends at byte {stream1_end} "
+            f"but GPU binary is only {gpu} bytes. "
+            f"(stream0_size={stream0_size}, vertex_count={vertex_count})"
+        )
+
+    # Patch positions in stream-1 (XYZ float32 at bytes 0-11 of each record)
+    patched = bytearray(original_gpu_bytes)
+    for i in range(vertex_count):
+        base = stream1_start + i * stream1_stride
+        vx, vy, vz = struct.unpack_from('<fff', patched, base)
+            
+        struct.pack_into('<fff', patched, base,
+                         vx * scale_x,
+                         vy * scale_y,
+                         vz * scale_z)
+
+    return bytes(patched), original_primary_bytes
