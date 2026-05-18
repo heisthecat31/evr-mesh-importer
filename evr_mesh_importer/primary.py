@@ -26,13 +26,13 @@ def _find_primary_path(gpu_filepath):
 
     # 1. Flat hash sibling: parent/fname -> sibling/fname
     candidate1 = os.path.join(grandparent, primary_folder, fname)
-    if os.path.isfile(candidate1):
+    if candidate1 != gpu_filepath and os.path.isfile(candidate1):
         return candidate1
 
     # 2. Nested hash sibling: GPU/parent/fname -> Primary/sibling/fname
     ggparent = os.path.dirname(grandparent)
     candidate2 = os.path.join(ggparent, "Primary", primary_folder, fname)
-    if os.path.isfile(candidate2):
+    if candidate2 != gpu_filepath and os.path.isfile(candidate2):
         return candidate2
 
     # 3. Recursive fallback under grandparent
@@ -58,7 +58,7 @@ def _find_primary_path(gpu_filepath):
                 return candidate
 
     sibling = os.path.join(grandparent, "Primary", fname)
-    if os.path.isfile(sibling):
+    if sibling != gpu_filepath and os.path.isfile(sibling):
         return sibling
 
     return None

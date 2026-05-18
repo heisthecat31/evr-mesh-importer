@@ -725,9 +725,11 @@ def encode_primary_described_multi_submesh_replace(
     """
     import struct
 
-    # Count actual rendering blocks in the original template to know how many submeshes are expected
-    expected_blocks = []
     n_meta = len(original_primary_bytes)
+
+    # 1. Parse all descriptor, block, and structured array locations BEFORE patching
+    # to avoid in-place corruption during parsing of contiguous/nested fields.
+    ob_blocks = []
     for off in range(0, n_meta - 60, 4):
         val = struct.unpack_from('<I', original_primary_bytes, off)[0]
         if val == 0x0B:
@@ -742,15 +744,44 @@ def encode_primary_described_multi_submesh_replace(
                     fc = ib_cnt // 3
                 else:
                     fc = vc
-                expected_blocks.append((off, vc, s0_sz, fc))
+                ob_blocks.append((off, vc, s0_sz, fc))
 
-    if not expected_blocks:
+    if not ob_blocks:
         raise ValueError("No valid rendering blocks found in the original Primary template.")
 
-    # Determine stride
+    # Structured arrays at the start of CGMeshListResource Primary files
+    sizes = (0x98, 0x70, 0x150, 0x150, 0x10, 0x10, 0x04, 0x04, 0x10, 0x18)
+    arrays = []
+    off = 0
+    for stride in sizes:
+        if off + 4 <= n_meta:
+            count = struct.unpack_from("<I", original_primary_bytes, off)[0]
+            base = off + 4
+            arrays.append((base, count, stride))
+            off = base + count * stride
+    tail_offset = off
+
+    # 0xFFFFFF0C descriptors scanned in CGMeshListResource fallback decoding path
+    descriptor_offs = []
+    for doff in range(0, n_meta - 0x40, 4):
+        vals = struct.unpack_from("<14I", original_primary_bytes, doff)
+        if vals[0] == 0xFFFFFF0C and vals[1] == 0xFFFFFFFF:
+            if vals[2] in (0x0B, 0x0D) and vals[3] == 0:
+                vertex_count = vals[9]
+                if vertex_count > 0 and vals[10] == vertex_count:
+                    descriptor_offs.append(doff)
+
+    # stream_records scanned in CGMeshListResource fallback decoding path
+    stream_record_offs = []
+    for soff in range(0, n_meta - 0x20, 0x08):
+        vals = struct.unpack_from("<8I", original_primary_bytes, soff)
+        if vals[0] == 4 and vals[2] and vals[4] and vals[5] in (0x2008, 0x2048):
+            stream_record_offs.append(soff)
+
+    # 2. Determine stride
     if stream0_stride is None:
         detected_stride = None
-        for off, vc, s0_sz, fc in expected_blocks:
+        for off_ob, vc, s0_sz, fc in ob_blocks:
             if s0_sz % vc == 0:
                 cand = s0_sz // vc
                 if 12 <= cand <= 64:
@@ -758,11 +789,11 @@ def encode_primary_described_multi_submesh_replace(
                     break
         stream0_stride = detected_stride if detected_stride is not None else 16
 
-    # Match Blender submeshes to the expected blocks.
+    # 3. Match Blender submeshes to the expected blocks.
     # If the user has fewer submeshes, we pad extra submeshes with clean dummy placeholder points.
     processed_subs = []
-    for idx in range(len(expected_blocks)):
-        off, orig_vc, s0_sz, orig_fc = expected_blocks[idx]
+    for idx in range(len(ob_blocks)):
+        off_ob, orig_vc, s0_sz, orig_fc = ob_blocks[idx]
         if idx < len(submesh_list):
             sub = submesh_list[idx]
             if len(sub) == 3:
@@ -827,38 +858,82 @@ def encode_primary_described_multi_submesh_replace(
         padding = orig_gpu_size - len(new_gpu)
         new_gpu += b'\x00' * padding
 
-    # Patch Primary
+    # 4. Patch Primary
     patched_primary = bytearray(original_primary_bytes)
-    block_index = 0
-    for off in range(0, n_meta - 60, 4):
-        val = struct.unpack_from('<I', patched_primary, off)[0]
-        if val == 0x0B:
-            vc = struct.unpack_from('<I', patched_primary, off + 7*4)[0]
-            vc2 = struct.unpack_from('<I', patched_primary, off + 8*4)[0]
-            vc3 = struct.unpack_from('<I', patched_primary, off + 11*4)[0]
-            if vc == vc2 == vc3 and vc > 0:
-                if block_index < len(submesh_offsets):
-                    s0_start, s0_size, nv, ib_offset, ib_count = submesh_offsets[block_index]
 
-                    # Force ALL submeshes to be Linear rendering blocks (rk = 2)!
-                    # This ensures perfect DirectX buffer layout alignment (stride-16/24) and index buffers!
-                    target_rk = 2
-                    struct.pack_into('<I', patched_primary, off + 14*4, target_rk)
+    # Patch 0x0B sentinel blocks
+    for block_index, (off_ob, vc, s0_sz, fc) in enumerate(ob_blocks):
+        if block_index < len(submesh_offsets):
+            s0_start, s0_size, nv, ib_offset, ib_count = submesh_offsets[block_index]
 
-                    fields = [
-                        (2, s0_start),
-                        (4, s0_size),
-                        (7, nv),
-                        (8, nv),
-                        (11, nv),
-                        (12, ib_offset),
-                        (13, ib_count),
-                    ]
+            # Force ALL submeshes to be Linear rendering blocks (rk = 2)!
+            # This ensures perfect DirectX buffer layout alignment (stride-16/24) and index buffers!
+            target_rk = 2
+            struct.pack_into('<I', patched_primary, off_ob + 14*4, target_rk)
 
-                    for field_index, value in fields:
-                        struct.pack_into('<I', patched_primary, off + field_index * 4, value)
+            fields = [
+                (2, s0_start),
+                (4, s0_size),
+                (7, nv),
+                (8, nv),
+                (11, nv),
+                (12, ib_offset),
+                (13, ib_count),
+            ]
 
-                    block_index += 1
+            for field_index, value in fields:
+                struct.pack_into('<I', patched_primary, off_ob + field_index * 4, value)
+
+    # Patch structured arrays (if CGMeshListResource Primary structure matches exactly)
+    if len(arrays) == 10:
+        array1_base, array1_count, _ = arrays[1]
+        array2_base, array2_count, _ = arrays[2]
+        array5_base, array5_count, _ = arrays[5]
+
+        for block_index in range(min(len(submesh_offsets), array2_count)):
+            s0_start, s0_size, nv, ib_offset, ib_count = submesh_offsets[block_index]
+
+            # Array 1: Stream record vertex count
+            if block_index < array1_count:
+                rec_off = array1_base + block_index * 0x70
+                struct.pack_into('<I', patched_primary, rec_off + 0x48, nv)
+
+            # Array 2: Main mesh metadata record
+            rec_off = array2_base + block_index * 0x150
+            struct.pack_into('<I', patched_primary, rec_off + 0x128, s0_start)
+            struct.pack_into('<I', patched_primary, rec_off + 0x130, s0_size)
+            struct.pack_into('<I', patched_primary, rec_off + 0x13c, nv)
+            struct.pack_into('<I', patched_primary, rec_off + 0x140, nv)
+
+            # Array 5: Index buffer range metadata record
+            if block_index < array5_count:
+                rec_off = array5_base + block_index * 0x10
+                struct.pack_into('<I', patched_primary, rec_off + 0x00, ib_offset)
+                struct.pack_into('<I', patched_primary, rec_off + 0x04, ib_count * 2) # Size in bytes (16-bit indices)
+                struct.pack_into('<I', patched_primary, rec_off + 0x08, 2)            # Force Linear range kind
+                struct.pack_into('<I', patched_primary, rec_off + 0x0c, 0)            # Force range extra to 0
+
+    # Patch 0xFFFFFF0C descriptors (fallback path)
+    for block_index, doff in enumerate(descriptor_offs):
+        if block_index < len(submesh_offsets):
+            s0_start, s0_size, nv, ib_offset, ib_count = submesh_offsets[block_index]
+            struct.pack_into('<I', patched_primary, doff + 4*4, s0_start)
+            struct.pack_into('<I', patched_primary, doff + 6*4, s0_size)
+            struct.pack_into('<I', patched_primary, doff + 9*4, nv)
+            struct.pack_into('<I', patched_primary, doff + 10*4, nv)
+            struct.pack_into('<I', patched_primary, doff + 13*4, nv)
+
+    # Patch stream_records (fallback path)
+    for block_index, soff in enumerate(stream_record_offs):
+        if block_index < len(submesh_offsets):
+            s0_start, s0_size, nv, ib_offset, ib_count = submesh_offsets[block_index]
+            struct.pack_into('<I', patched_primary, soff + 2*4, nv)
+            struct.pack_into('<I', patched_primary, soff + 4*4, ib_count)
+
+    # Patch tail (CGMeshListResource files only)
+    if len(arrays) == 10 and tail_offset + 16 <= n_meta:
+        struct.pack_into('<I', patched_primary, tail_offset + 4, current_offset)
+        struct.pack_into('<Q', patched_primary, tail_offset + 8, len(new_gpu))
 
     return bytes(new_gpu), bytes(patched_primary)
 
