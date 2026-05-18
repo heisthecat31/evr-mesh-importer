@@ -890,13 +890,21 @@ def encode_primary_described_multi_submesh_replace(
         array2_base, array2_count, _ = arrays[2]
         array5_base, array5_count, _ = arrays[5]
 
+        # Patch Array 1: Stream record vertex counts (including LODs/Shadows)
+        # Scan all Array 1 records, read original vertex count, and patch with new vertex count.
+        orig_block_vertex_counts = [block[1] for block in ob_blocks]
+        for r_idx in range(array1_count):
+            rec_off = array1_base + r_idx * 0x70
+            orig_vc = struct.unpack_from('<I', original_primary_bytes, rec_off + 0x48)[0]
+            for block_idx, orig_block_vc in enumerate(orig_block_vertex_counts):
+                if orig_vc == orig_block_vc:
+                    if block_idx < len(submesh_offsets):
+                        new_nv = submesh_offsets[block_idx][2]
+                        struct.pack_into('<I', patched_primary, rec_off + 0x48, new_nv)
+                        break
+
         for block_index in range(min(len(submesh_offsets), array2_count)):
             s0_start, s0_size, nv, ib_offset, ib_count = submesh_offsets[block_index]
-
-            # Array 1: Stream record vertex count
-            if block_index < array1_count:
-                rec_off = array1_base + block_index * 0x70
-                struct.pack_into('<I', patched_primary, rec_off + 0x48, nv)
 
             # Array 2: Main mesh metadata record
             rec_off = array2_base + block_index * 0x150
@@ -904,6 +912,7 @@ def encode_primary_described_multi_submesh_replace(
             struct.pack_into('<I', patched_primary, rec_off + 0x130, s0_size)
             struct.pack_into('<I', patched_primary, rec_off + 0x13c, nv)
             struct.pack_into('<I', patched_primary, rec_off + 0x140, nv)
+            struct.pack_into('<I', patched_primary, rec_off + 0x14c, nv)
 
             # Array 5: Index buffer range metadata record
             if block_index < array5_count:
