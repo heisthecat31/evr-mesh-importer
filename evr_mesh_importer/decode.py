@@ -180,14 +180,14 @@ def _extract_primary_described_cimr_mesh(gpu_data, primary_data):
             continue
         if range_kind != 2 or index_words < 3 or index_words % 3 != 0:
             continue
-        if stream0_size not in (vertex_count * 16, vertex_count * 20):
+        if stream0_size not in (vertex_count * 16, vertex_count * 20) and not (stream0_size > 0 and (stream0_size % 16 == 0 or stream0_size % 20 == 0)):
             continue
         if base_offset != 0 and vertex_count < max_block_vc:
             continue
 
         if base_offset == 0:
             pos_start = stream0_size
-            index_range_valid = index_offset == pos_start + vertex_count * 28
+            index_range_valid = index_offset >= pos_start + vertex_count * 28
         else:
             pos_start = base_offset + stream0_size
             index_range_valid = (index_offset < base_offset and
@@ -292,7 +292,7 @@ def _extract_hero_cimr_mesh(gpu_data, primary_data):
 
         if vertex_count == 0 or vals[8] != vertex_count or vals[11] != vertex_count:
             continue
-        if stream0_size not in (vertex_count * 16, vertex_count * 20, vertex_count * 28):
+        if stream0_size not in (vertex_count * 16, vertex_count * 20, vertex_count * 28) and not (stream0_size > 0 and (stream0_size % 16 == 0 or stream0_size % 20 == 0 or stream0_size % 28 == 0)):
             continue
 
         pos_start = (base_offset + stream0_size) if base_offset else stream0_size
@@ -300,11 +300,20 @@ def _extract_hero_cimr_mesh(gpu_data, primary_data):
         if pos_end > len(gpu_data):
             continue
 
-        remaining = len(gpu_data) - pos_end
+        # Scan forward from pos_end to find the start of the index buffer (skipping padding)
+        ib_start = pos_end
+        for offset in range(pos_end, min(pos_end + 32768, len(gpu_data) - 6), 2):
+            idx0, idx1, idx2 = struct.unpack_from("<HHH", gpu_data, offset)
+            if idx0 < vertex_count and idx1 < vertex_count and idx2 < vertex_count:
+                if not (idx0 == idx1 or idx1 == idx2 or idx0 == idx2):
+                    ib_start = offset
+                    break
+
+        remaining = len(gpu_data) - ib_start
         max_scan = min(remaining // 2, vertex_count * 8)
         n_valid = 0
         for k in range(max_scan):
-            idx = struct.unpack_from("<H", gpu_data, pos_end + k * 2)[0]
+            idx = struct.unpack_from("<H", gpu_data, ib_start + k * 2)[0]
             if idx >= vertex_count:
                 break
             n_valid += 1
@@ -312,7 +321,7 @@ def _extract_hero_cimr_mesh(gpu_data, primary_data):
         if n_valid < 3:
             continue
 
-        idxs = struct.unpack_from(f"<{n_valid}H", gpu_data, pos_end)
+        idxs = struct.unpack_from(f"<{n_valid}H", gpu_data, ib_start)
 
         for pos_off in (0, 4, 8, 12, 16):
             verts = []
@@ -407,13 +416,14 @@ def _extract_crossref_ib_cimr_mesh(gpu_data, primary_data):
             continue
         base = vals[2]; s0 = vals[4]; rkind = vals[14]
         ioff = vals[12]; iwords = vals[13]
-        if s0 not in (vc * 16, vc * 20, vc * 28):
+        if s0 not in (vc * 16, vc * 20, vc * 28) and not (s0 > 0 and (s0 % 16 == 0 or s0 % 20 == 0 or s0 % 28 == 0)):
             continue
         pos_start = (base + s0) if base else s0
         pos_end = pos_start + vc * 28
         blocks.append((base, vc, s0, rkind, ioff, iwords, pos_start, pos_end))
 
     best = None
+    max_vc = max(b[1] for b in blocks) if blocks else 0
     for (base2, vc2, s0_2, rkind2, ioff2, iwords2, ps2, pe2) in blocks:
         if base2 == 0 or rkind2 != 2:
             continue
@@ -423,10 +433,10 @@ def _extract_crossref_ib_cimr_mesh(gpu_data, primary_data):
             continue
 
         idxs2 = struct.unpack_from(f"<{iwords2}H", gpu_data, ioff2)
-        if any(idx >= vc2 for idx in idxs2):
+        if any(idx >= max_vc for idx in idxs2):
             continue
         unique_count = len(set(idxs2))
-        if unique_count >= vc2:
+        if unique_count > max_vc:
             continue
 
         effective_vc = max(idxs2) + 1
@@ -436,7 +446,7 @@ def _extract_crossref_ib_cimr_mesh(gpu_data, primary_data):
                 continue
             if rkind1 != 50855947:
                 continue
-            if pe1 != ioff2:
+            if ps1 + vc1 * 28 > ioff2:
                 continue
             if vc1 != effective_vc:
                 continue
@@ -706,21 +716,29 @@ def _extract_metadata_meshes(gpu_data, primary_data):
             if array2_count == array5_count:
                 for i in range(array2_count):
                     rec_off = array2_base + i * 0x150
-                    stream_rec_off = array1_base + i * 0x70
                     range_rec_off = array5_base + i * 0x10
 
                     base_offset = struct.unpack_from("<I", meta, rec_off + 0x128)[0]
                     stream0_size = struct.unpack_from("<I", meta, rec_off + 0x130)[0]
                     vertex_count = struct.unpack_from("<I", meta, rec_off + 0x13c)[0]
                     vertex_count_2 = struct.unpack_from("<I", meta, rec_off + 0x140)[0]
-                    stream_vertex_count = struct.unpack_from("<I", meta, stream_rec_off + 0x48)[0]
-                    index_offset, index_size, range_kind, range_extra = struct.unpack_from(
-                        "<IIII", meta, range_rec_off)
-
+                    
                     if vertex_count == 0 or vertex_count_2 != vertex_count:
                         continue
-                    if stream_vertex_count != vertex_count:
+
+                    # Find a stream record in Array 1 that matches the vertex count
+                    has_stream_rec = False
+                    array1_count = arrays[1][1]
+                    for r_idx in range(array1_count):
+                        test_off = array1_base + r_idx * 0x70
+                        if struct.unpack_from("<I", meta, test_off + 0x48)[0] == vertex_count:
+                            has_stream_rec = True
+                            break
+                    if not has_stream_rec:
                         continue
+
+                    index_offset, index_size, range_kind, range_extra = struct.unpack_from(
+                        "<IIII", meta, range_rec_off)
                     if range_kind != 2 or range_extra != 0 or index_size == 0:
                         continue
 
@@ -751,7 +769,7 @@ def _extract_metadata_meshes(gpu_data, primary_data):
             descriptors.append((doff, vals[4], vals[6], vertex_count))
 
         used_streams = [False] * len(stream_records)
-        for _doff, base_offset, stream0_size, descriptor_vcount in descriptors:
+        for desc_idx, (_doff, base_offset, stream0_size, descriptor_vcount) in enumerate(descriptors):
             vertex_count = descriptor_vcount
             stream_index = None
             for si, (record_vcount, _ic, _fmt, _ro) in enumerate(stream_records):
@@ -761,8 +779,15 @@ def _extract_metadata_meshes(gpu_data, primary_data):
             if stream_index is None:
                 continue
             _rvc, index_count, _fmt, _ro = stream_records[stream_index]
+
+            idx_offset = None
+            if 'arrays' in locals() and len(arrays) == 10:
+                array5_base, array5_count, _ = arrays[5]
+                if desc_idx < array5_count:
+                    idx_offset = struct.unpack_from("<I", meta, array5_base + desc_idx * 0x10)[0]
+
             result = _extract_cgml_ranges(gpu_data, base_offset, stream0_size,
-                                          vertex_count, index_count, 28)
+                                          vertex_count, index_count, 28, idx_offset)
             if result is None:
                 continue
             used_streams[stream_index] = True
@@ -1309,6 +1334,10 @@ def extract_mesh(gpu_filepath, primary_data=None, auto_find_primary=True):
         primary_data = _find_primary_data(gpu_filepath)
 
     if primary_data:
+        result = _extract_metadata_meshes(data, primary_data)
+        if result:
+            return result, "cgml"
+
         result = _extract_primary_described_cimr_mesh(data, primary_data)
         if result:
             return result, "primary_described"
@@ -1321,11 +1350,6 @@ def extract_mesh(gpu_filepath, primary_data=None, auto_find_primary=True):
             return crossref, "crossref_ib"
         if hero:
             return hero, "hero"
-
-    if primary_data:
-        result = _extract_metadata_meshes(data, primary_data)
-        if result:
-            return result, "cgml"
 
     result = _extract_dual28_prefixed_mesh(data)
     if result:

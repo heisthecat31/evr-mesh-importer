@@ -418,10 +418,26 @@ class EVR_OT_ExportMesh(Operator, ExportHelper):
                         orig_primary = f.read()
                     
                     if len(orig_primary) > 64:
-                        # Count how many rendering blocks are in the original Primary template
-                        block_count = 0
                         import struct
                         n_meta = len(orig_primary)
+
+                        # Auto-detect stride from template if s0_stride is None (i.e. 'auto')
+                        if s0_stride is None:
+                            for off in range(0, n_meta - 60, 4):
+                                val = struct.unpack_from('<I', orig_primary, off)[0]
+                                if val == 0x0B:
+                                    vc = struct.unpack_from('<I', orig_primary, off + 7*4)[0]
+                                    vc2 = struct.unpack_from('<I', orig_primary, off + 8*4)[0]
+                                    vc3 = struct.unpack_from('<I', orig_primary, off + 11*4)[0]
+                                    if vc == vc2 == vc3 and vc > 0:
+                                        s0_size = struct.unpack_from('<I', orig_primary, off + 4*4)[0]
+                                        detected_stride = s0_size // vc
+                                        if detected_stride in (16, 20):
+                                            s0_stride = detected_stride
+                                            break
+
+                        # Count how many rendering blocks are in the original Primary template
+                        block_count = 0
                         for off in range(0, n_meta - 60, 4):
                             val = struct.unpack_from('<I', orig_primary, off)[0]
                             if val == 0x0B:
@@ -463,6 +479,8 @@ class EVR_OT_ExportMesh(Operator, ExportHelper):
                             self.report({'WARNING'}, f"Template-based replacement failed: {e}. Falling back to standard export.")
                 
                 if not patched:
+                    if s0_stride is None:
+                        s0_stride = 20
                     gpu_data, primary_data = encode_primary_described(
                         verts, faces, uvs=uvs, stream0_stride=s0_stride, compute_normals=cn)
                     self._write_gpu(gpu_path, gpu_data)
