@@ -61,7 +61,6 @@ def _float_to_snorm16(f):
 
 def _float_to_float16(f):
     """Pack a float32 to float16 bits (as uint16)."""
-    # Use struct for correct IEEE half conversion
     return struct.unpack('<H', struct.pack('<e', f))[0]
 
 
@@ -77,15 +76,13 @@ def _compute_smooth_normals(verts, faces):
     normals = [[0.0, 0.0, 0.0] for _ in verts]
     for face in faces:
         fn = _face_normal(verts, face)
-        # Weight by triangle area (proportional to cross product magnitude,
-        # already captured via non-normalized normal before _normalize)
         v0, v1, v2 = [verts[i] for i in face]
         e1 = (v1[0]-v0[0], v1[1]-v0[1], v1[2]-v0[2])
         e2 = (v2[0]-v0[0], v2[1]-v0[1], v2[2]-v0[2])
         cx = e1[1]*e2[2] - e1[2]*e2[1]
         cy = e1[2]*e2[0] - e1[0]*e2[2]
         cz = e1[0]*e2[1] - e1[1]*e2[0]
-        area = math.sqrt(cx*cx + cy*cy + cz*cz)  # 2× triangle area
+        area = math.sqrt(cx*cx + cy*cy + cz*cz)
         for idx in face:
             normals[idx][0] += fn[0] * area
             normals[idx][1] += fn[1] * area
@@ -97,10 +94,8 @@ def _make_tangent_frame(normal):
     """
     Build an arbitrary but consistent tangent (T) and bitangent (B) from a normal.
     Returns (tangent_xyz, handedness) where handedness is +1.0 or -1.0.
-    The tangent is perpendicular to the normal and non-degenerate.
     """
     nx, ny, nz = normal
-    # Choose the axis least aligned with the normal to avoid degeneracy
     if abs(nx) <= abs(ny) and abs(nx) <= abs(nz):
         ref = (1.0, 0.0, 0.0)
     elif abs(ny) <= abs(nz):
@@ -108,10 +103,8 @@ def _make_tangent_frame(normal):
     else:
         ref = (0.0, 0.0, 1.0)
 
-    # T = normalize(ref - (ref·N)N)
     d = _dot(ref, normal)
     t = _normalize((ref[0] - d*nx, ref[1] - d*ny, ref[2] - d*nz))
-    # Handedness from cross product sign
     b = _cross(normal, t)
     handedness = 1.0 if _dot(b, b) > 0 else -1.0
     return t, handedness
@@ -122,10 +115,7 @@ def _make_tangent_frame(normal):
 # ============================================================
 
 def _pack_stream0_s16(vertex_count, uvs=None):
-    """
-    Stream-0 stride-16: most common CIMR pattern.
-    Records are 0xFFFFFFFF 0x00000000 [UV.u:float32] [UV.v:float32]
-    """
+    """Stream-0 stride-16: 0xFFFFFFFF 0x00000000 UV.u UV.v"""
     out = bytearray()
     for i in range(vertex_count):
         u, v = uvs[i] if uvs else (0.0, 0.0)
@@ -134,10 +124,7 @@ def _pack_stream0_s16(vertex_count, uvs=None):
 
 
 def _pack_stream0_s20_white(vertex_count, uvs=None):
-    """
-    Stream-0 stride-20: vertex-colored variant, all-white (0xFFFFFFFF RGBA).
-    Layout: 0xFF000000 0xFFFFFFFF [UV.u:float32] [UV.v:float32] 0x00000000
-    """
+    """Stream-0 stride-20: 0xFF000000 0xFFFFFFFF UV.u UV.v 0x00000000"""
     out = bytearray()
     for i in range(vertex_count):
         u, v = uvs[i] if uvs else (0.0, 0.0)
@@ -146,20 +133,13 @@ def _pack_stream0_s20_white(vertex_count, uvs=None):
 
 
 def _pack_stream0_s28_ff(vertex_count):
-    """
-    Stream-0 stride-28: for dual-28 layout (both streams same stride).
-    First two dwords = 0xFFFFFFFF, rest zeroed.
-    Detected by _find_prefix_pair_run.
-    """
+    """Stream-0 stride-28: 0xFFFFFFFF 0xFFFFFFFF + 20 zero bytes"""
     record = struct.pack('<II', 0xFFFFFFFF, 0xFFFFFFFF) + b'\x00' * 20
     return record * vertex_count
 
 
 def _pack_stream0_s44(vertex_count, uvs=None):
-    """
-    Stream-0 stride-44: props and environment assets.
-    Layout: 0xFF000000 0xFF000000 [UV.u:float32] [UV.v:float32] [UV.u:float32] [UV.v:float32] followed by 20 bytes of zero padding.
-    """
+    """Stream-0 stride-44: 0xFF000000 0xFF000000 UV UV UV UV + 20 zero bytes"""
     out = bytearray()
     for i in range(vertex_count):
         u, v = uvs[i] if uvs else (0.0, 0.0)
@@ -168,26 +148,22 @@ def _pack_stream0_s44(vertex_count, uvs=None):
 
 
 def _pack_stream0_dynamic(vertex_count, stride, uvs=None):
-    """
-    Dynamically pack stream-0 to match the required stride perfectly.
-    Supports standard 16, 20, and extended strides (e.g. 44 for props).
-    """
+    """Dynamically pack stream-0 to match the required stride."""
     if stride == 16:
         return _pack_stream0_s16(vertex_count, uvs=uvs)
     elif stride == 20:
         return _pack_stream0_s20_white(vertex_count, uvs=uvs)
+    elif stride == 28:
+        return _pack_stream0_s28_ff(vertex_count)
     elif stride == 44:
         return _pack_stream0_s44(vertex_count, uvs=uvs)
 
     out = bytearray()
     for i in range(vertex_count):
         u, v = uvs[i] if uvs else (0.0, 0.0)
-        # Start with standard double-color prefix and UVs
         record = bytearray(struct.pack('<IIff', 0xFF000000, 0xFF000000, u, v))
-        # If there's space, repeat UVs (common in 44-stride props)
         if stride >= 24:
             record += struct.pack('<ff', u, v)
-        # Pad the rest of the record to match stride
         if len(record) < stride:
             record += b'\x00' * (stride - len(record))
         elif len(record) > stride:
@@ -203,14 +179,11 @@ def _pack_stream1_with_normals(verts, normals):
       [12-13] snorm16     — normal.x
       [14-15] snorm16     — normal.y
       [16-17] snorm16     — normal.z
-      [18-19] snorm16     — 0 (padding / tangent sign placeholder)
+      [18-19] snorm16     — 0 (padding)
       [20-21] snorm16     — tangent.x
       [22-23] snorm16     — tangent.y
       [24-25] snorm16     — tangent.z
-      [26-27] snorm16     — tangent handedness (+1 or -1, packed as ±32767)
-
-    UVs are omitted (zeroed) since we don't have a UV map.
-    Total: 12 + 2+2+2+2 + 2+2+2+2 = 28 bytes ✓
+      [26-27] snorm16     — tangent handedness (±32767)
     """
     out = bytearray()
     for i, ((x, y, z), (nx, ny, nz)) in enumerate(zip(verts, normals)):
@@ -222,7 +195,7 @@ def _pack_stream1_with_normals(verts, normals):
             _float_to_snorm16(nx),
             _float_to_snorm16(ny),
             _float_to_snorm16(nz),
-            0,   # padding
+            0,
         )
         out += struct.pack('<hhhh',
             _float_to_snorm16(tx),
@@ -234,10 +207,7 @@ def _pack_stream1_with_normals(verts, normals):
 
 
 def _pack_stream1_zeroed(verts):
-    """
-    Fallback stream-1 with normals zeroed. Use only if normal computation
-    fails or is not needed (e.g. testing geometry first).
-    """
+    """Fallback stream-1 with normals zeroed."""
     out = bytearray()
     for x, y, z in verts:
         out += struct.pack('<fff', x, y, z)
@@ -256,7 +226,7 @@ def _pack_index_buffer_u16(faces):
 
 
 def _pack_index_buffer_u32(faces):
-    """Triangle list as uint32 words (for CGML kind-4 path)."""
+    """Triangle list as uint32 words."""
     out = bytearray()
     for i0, i1, i2 in faces:
         out += struct.pack('<III', i0, i1, i2)
@@ -292,28 +262,7 @@ def _validate_mesh(verts, faces, label="mesh", allow_degenerate=False):
 # ============================================================
 
 def encode_heuristic_s16(verts, faces, uvs=None, compute_normals=True):
-    """
-    Encode a mesh using the heuristic stride-16 stream-0 layout.
-
-    This is the safest encode target — the widest family of CIMR props
-    uses this layout, and the heuristic decoder finds it via _find_runs.
-
-    Layout:
-      [stream-0] Nv × 16 bytes  (0xFFFFFFFF seed, detected by heuristic)
-      [stream-1] Nv × 28 bytes  (XYZ at offset 0, normals packed as snorm16)
-      [index buffer] Nt × 6 bytes  (uint16 triangle list)
-
-    Args:
-        verts:           [(x, y, z), ...]
-        faces:           [(i0, i1, i2), ...]  — must all be < len(verts)
-        uvs:             optional [(u, v), ...] UV coordinates
-        compute_normals: if True, compute smooth normals from topology.
-                         if False, stream-1 normals are zeroed (safe for
-                         geometry testing but will look flat/wrong in-game).
-
-    Returns:
-        bytes — the complete GPU binary to write over the original file.
-    """
+    """Encode using heuristic stride-16 stream-0 layout."""
     _validate_mesh(verts, faces, "heuristic_s16")
     s0 = _pack_stream0_s16(len(verts), uvs=uvs)
     if compute_normals:
@@ -326,15 +275,7 @@ def encode_heuristic_s16(verts, faces, uvs=None, compute_normals=True):
 
 
 def encode_heuristic_s20(verts, faces, uvs=None, compute_normals=True):
-    """
-    Encode using the heuristic stride-20 stream-0 layout (vertex-colored family).
-
-    Same as encode_heuristic_s16 but stream-0 uses stride-20 white records.
-    Use this when the original file decoded via the vertex-colored heuristic path.
-
-    Returns:
-        bytes — the complete GPU binary.
-    """
+    """Encode using heuristic stride-20 stream-0 layout."""
     _validate_mesh(verts, faces, "heuristic_s20")
     s0 = _pack_stream0_s20_white(len(verts), uvs=uvs)
     if compute_normals:
@@ -347,18 +288,7 @@ def encode_heuristic_s20(verts, faces, uvs=None, compute_normals=True):
 
 
 def encode_heuristic_dual28(verts, faces, compute_normals=True):
-    """
-    Encode using the dual-28 layout (both streams stride-28).
-
-    Use when the original file decoded via _extract_dual28_prefixed_mesh or
-    _extract_multi28_suffix_mesh. Stream-0 uses 0xFFFFFFFF 0xFFFFFFFF prefix.
-
-    Note: the decoder requires at least 16 vertices (_find_prefix_pair_run
-    min_records=16). Meshes smaller than 16 verts will fail to decode.
-
-    Returns:
-        bytes — the complete GPU binary.
-    """
+    """Encode using dual-28 layout."""
     _validate_mesh(verts, faces, "heuristic_dual28")
     s0 = _pack_stream0_s28_ff(len(verts))
     if compute_normals:
@@ -371,24 +301,7 @@ def encode_heuristic_dual28(verts, faces, compute_normals=True):
 
 
 def encode_primary_described(verts, faces, uvs=None, stream0_stride=16, compute_normals=True):
-    """
-    Encode a mesh in the primary_described layout and produce a matching
-    Primary binary. Both files must be written for the game to load correctly.
-
-    Layout (base_offset=0):
-      GPU:     [stream-0: Nv*s0] [stream-1: Nv*28] [index buffer]
-      Primary: [0x0B descriptor block: 16 × uint32]
-
-    Args:
-        verts:           [(x, y, z), ...]
-        faces:           [(i0, i1, i2), ...]
-        uvs:             optional [(u, v), ...] UV coordinates
-        stream0_stride:  16 or 20 — must match the original file's s0_stride.
-        compute_normals: pack smooth normals into stream-1.
-
-    Returns:
-        (gpu_data: bytes, primary_data: bytes)
-    """
+    """Encode in primary_described layout with matching Primary binary."""
     _validate_mesh(verts, faces, "primary_described")
     assert stream0_stride in (16, 20), "stream0_stride must be 16 or 20"
 
@@ -409,51 +322,21 @@ def encode_primary_described(verts, faces, uvs=None, stream0_stride=16, compute_
     ib = _pack_index_buffer_u16(faces)
     gpu_data = s0 + s1 + ib
 
-    # Build matching Primary descriptor (block type 0x0B, 16 dwords)
     stream0_size = nv * stream0_stride
-    index_offset = stream0_size + nv * 28   # immediately after stream-1
+    index_offset = stream0_size + nv * 28
 
     primary_data = struct.pack('<16I',
-        0x0B,            # [0]  block type sentinel
-        0,               # [1]  padding
-        0,               # [2]  base_offset (0 = linear layout)
-        0,               # [3]  padding
-        stream0_size,    # [4]  stream0_size (tells decoder where s1 starts)
-        0,               # [5]  unused
-        0,               # [6]  unused
-        nv,              # [7]  vertex_count  ← checked: must equal [8] and [11]
-        nv,              # [8]  vertex_count copy
-        0,               # [9]  unused
-        0,               # [10] unused
-        nv,              # [11] vertex_count copy
-        index_offset,    # [12] index_offset in GPU binary
-        nt * 3,          # [13] index_words (number of uint16 indices)
-        2,               # [14] range_kind = 2 (the only kind primary_described accepts)
-        0,               # [15] unused
+        0x0B, 0, 0, 0,
+        stream0_size, 0, 0,
+        nv, nv, 0, 0, nv,
+        index_offset, nt * 3, 2, 0,
     )
 
     return gpu_data, primary_data
 
 
 def encode_cgml(submesh_list, compute_normals=True):
-    """
-    Encode a multi-submesh CGML (map geometry) file.
-
-    Each submesh is encoded as an independent heuristic_s16 block concatenated
-    in sequence. The Primary metadata for CGML files is complex and varies per
-    map — this encoder targets maps whose Primary uses the compact path
-    (_decode_compact_cgml), which reads base offsets from fixed Primary offsets.
-
-    For a full CGML replacement you also need to patch the Primary file.
-    See encode_cgml_primary() for that.
-
-    Args:
-        submesh_list:    [(verts, faces, uvs), ...] or [(verts, faces), ...]
-        compute_normals: pack smooth normals.
-
-    Returns:
-        bytes — concatenated GPU binary for all submeshes.
-    """
+    """Encode multi-submesh CGML as concatenated heuristic_s16 blocks."""
     out = bytearray()
     for i, sub in enumerate(submesh_list):
         if len(sub) == 3:
@@ -467,28 +350,509 @@ def encode_cgml(submesh_list, compute_normals=True):
 
 
 # ============================================================
+# CGML In-Place Replace — the core fix for CGMeshListResource
+# ============================================================
+
+def encode_cgml_inplace_replace(original_gpu_bytes, original_primary_bytes,
+                                  submesh_list, stream0_stride=16,
+                                  compute_normals=True):
+    """
+    CGML replacement: keep ALL original sizes, just replace the data.
+    Stream-0: copy from original
+    Stream-1: new positions, padded to original size
+    Index buffer: new indices, padded to original size
+    Primary: only update vertex_count fields, nothing else changes
+    """
+    n_meta = len(original_primary_bytes)
+
+    sizes = (0x98, 0x70, 0x150, 0x150, 0x10, 0x10, 0x04, 0x04, 0x10, 0x18)
+    arrays = []
+    off = 0
+    for stride in sizes:
+        if off + 4 > n_meta:
+            raise ValueError("Primary file too short for CGML 10-array layout.")
+        count = struct.unpack_from("<I", original_primary_bytes, off)[0]
+        if count > 1000:
+            raise ValueError(f"CGML array count too large: {count}")
+        base = off + 4
+        end = base + count * stride
+        if end > n_meta:
+            raise ValueError("CGML array extends past end of Primary file.")
+        arrays.append((base, count, stride))
+        off = end
+
+    tail_offset = off
+
+    if len(arrays) != 10:
+        raise ValueError("Primary file does not have the expected 10-array CGML layout.")
+
+    array1_base, array1_count, _ = arrays[1]
+    array2_base, array2_count, _ = arrays[2]
+    array5_base, array5_count, _ = arrays[5]
+
+    if array2_count == 0:
+        raise ValueError("CGML Primary has zero submeshes (array2_count=0).")
+
+    if tail_offset + 16 > n_meta:
+        raise ValueError("CGML Primary tail missing.")
+    tail_a, orig_mesh_data_end, orig_gpu_size = struct.unpack_from(
+        "<IIQ", original_primary_bytes, tail_offset)
+
+    if len(submesh_list) == 0:
+        raise ValueError("No submeshes provided for CGML replacement.")
+    
+    first_sub = submesh_list[0]
+    if len(first_sub) == 3:
+        verts, faces, uvs = first_sub
+    else:
+        verts, faces = first_sub
+        uvs = None
+    
+    _validate_mesh(verts, faces, "cgml_replacement")
+    
+    nv = len(verts)
+    nt = len(faces)
+
+    # Read ALL original offsets and sizes - we preserve everything
+    orig_descriptors = []
+    for i in range(array2_count):
+        rec_off = array2_base + i * 0x150
+        base_offset = struct.unpack_from("<I", original_primary_bytes, rec_off + 0x128)[0]
+        s0_size = struct.unpack_from("<I", original_primary_bytes, rec_off + 0x130)[0]
+        vc = struct.unpack_from("<I", original_primary_bytes, rec_off + 0x13c)[0]
+        
+        ib_off = 0
+        ib_size = 0
+        if i < array5_count:
+            range_rec = array5_base + i * 0x10
+            ib_off = struct.unpack_from("<I", original_primary_bytes, range_rec + 0x00)[0]
+            ib_size = struct.unpack_from("<I", original_primary_bytes, range_rec + 0x04)[0]
+        
+        orig_descriptors.append({
+            'base_offset': base_offset,
+            's0_size': s0_size,
+            'vc': vc,
+            'ib_off': ib_off,
+            'ib_size': ib_size,
+        })
+
+    # Use first slot's capacities
+    first = orig_descriptors[0]
+    if nv > first['vc']:
+        raise ValueError(f"New vertex count {nv} exceeds original {first['vc']}.")
+
+    # Detect stride
+    if stream0_stride is None:
+        if first['vc'] > 0 and first['s0_size'] % first['vc'] == 0:
+            cand = first['s0_size'] // first['vc']
+            if 12 <= cand <= 64:
+                stream0_stride = cand
+        if stream0_stride is None:
+            stream0_stride = 16
+
+    # --- Patch GPU in-place ---
+    patched_gpu = bytearray(original_gpu_bytes)
+    patched_primary = bytearray(original_primary_bytes)
+
+    for i, desc in enumerate(orig_descriptors):
+        # Stream-0: copy first nv records from original, pad to original size
+        orig_s0 = original_gpu_bytes[desc['base_offset'] : desc['base_offset'] + desc['s0_size']]
+        new_s0 = bytearray(orig_s0[:nv * stream0_stride])
+        last_s0 = new_s0[-stream0_stride:] if new_s0 else orig_s0[:stream0_stride]
+        while len(new_s0) < desc['s0_size']:
+            new_s0 += last_s0
+        new_s0 = new_s0[:desc['s0_size']]
+        patched_gpu[desc['base_offset'] : desc['base_offset'] + desc['s0_size']] = new_s0
+
+        # Stream-1: new positions, padded to fill space up to original IB
+        s1_start = desc['base_offset'] + desc['s0_size']
+        orig_s1_end = desc['ib_off'] if desc['ib_off'] > s1_start else s1_start + desc['vc'] * 28
+        orig_s1_size = orig_s1_end - s1_start
+        
+        if compute_normals:
+            normals = _compute_smooth_normals(verts, faces)
+            s1 = _pack_stream1_with_normals(verts, normals)
+        else:
+            s1 = _pack_stream1_zeroed(verts)
+        
+        s1_padded = bytearray(s1)
+        last_s1 = s1[-28:] if s1 else b'\x00' * 28
+        while len(s1_padded) < orig_s1_size:
+            s1_padded += last_s1
+        s1_padded = s1_padded[:orig_s1_size]
+        patched_gpu[s1_start : s1_start + orig_s1_size] = s1_padded
+
+        # Index buffer: new indices, padded to original size
+        ib = bytearray()
+        for f in faces:
+            ib += struct.pack('<HHH', f[0], f[1], f[2])
+        
+        ib_padded = bytearray(ib)
+        while len(ib_padded) < desc['ib_size']:
+            ib_padded += b'\x00\x00'
+        ib_padded = ib_padded[:desc['ib_size']]
+        patched_gpu[desc['ib_off'] : desc['ib_off'] + desc['ib_size']] = ib_padded
+
+        # Update Primary Array 2 - only vertex counts
+        rec_off = array2_base + i * 0x150
+        struct.pack_into('<I', patched_primary, rec_off + 0x13c, nv)
+        struct.pack_into('<I', patched_primary, rec_off + 0x140, nv)
+        struct.pack_into('<I', patched_primary, rec_off + 0x14c, nv)
+
+    # Update Array 1
+    for r_idx in range(array1_count):
+        rec_off = array1_base + r_idx * 0x70
+        struct.pack_into('<I', patched_primary, rec_off + 0x48, nv)
+
+    return bytes(patched_gpu), bytes(patched_primary)
+
+
+# ============================================================
+# CIMR In-Place Replace (primary_described, single-block)
+# ============================================================
+
+def encode_primary_described_full_replace(
+        original_gpu_bytes,
+        original_primary_bytes,
+        verts,
+        faces,
+        uvs=None,
+        stream0_stride=None,
+        compute_normals=True):
+    """
+    Full mesh replacement for primary_described CIMR files using in-place swap.
+    Preserves original file offsets, sizes, and capacities exactly.
+    """
+    _validate_mesh(verts, faces, "primary_described_full_replace")
+
+    if len(original_primary_bytes) < 64:
+        raise ValueError(
+            f"Original Primary is only {len(original_primary_bytes)} bytes. "
+            "Need at least 64 bytes (the 16-dword descriptor block)."
+        )
+
+    # Scan all valid rendering blocks in the template
+    blocks = []
+    n_meta = len(original_primary_bytes)
+    detected_stride = None
+    for off in range(0, n_meta - 60, 4):
+        val = struct.unpack_from('<I', original_primary_bytes, off)[0]
+        if val == 0x0B:
+            vc = struct.unpack_from('<I', original_primary_bytes, off + 7*4)[0]
+            vc2 = struct.unpack_from('<I', original_primary_bytes, off + 8*4)[0]
+            vc3 = struct.unpack_from('<I', original_primary_bytes, off + 11*4)[0]
+            if vc == vc2 == vc3 and vc > 0:
+                s0_start = struct.unpack_from('<I', original_primary_bytes, off + 2*4)[0]
+                s0_size = struct.unpack_from('<I', original_primary_bytes, off + 4*4)[0]
+                rk = struct.unpack_from('<I', original_primary_bytes, off + 14*4)[0]
+                ib_offset = struct.unpack_from('<I', original_primary_bytes, off + 12*4)[0]
+                ib_count = struct.unpack_from('<I', original_primary_bytes, off + 13*4)[0]
+                blocks.append({
+                    'off': off, 'vc': vc, 's0_start': s0_start, 's0_size': s0_size,
+                    'rk': rk, 'ib_offset': ib_offset, 'ib_count': ib_count
+                })
+                if detected_stride is None and s0_size % vc == 0:
+                    cand = s0_size // vc
+                    if 12 <= cand <= 64:
+                        detected_stride = cand
+
+    if not blocks:
+        raise ValueError("No valid rendering blocks found in the original Primary template.")
+
+    lod0_block = max(blocks, key=lambda b: b['vc'])
+    linear_block = next((b for b in blocks if b['rk'] == 2), lod0_block)
+
+    if stream0_stride is None:
+        stream0_stride = detected_stride if detected_stride is not None else 16
+
+    new_nv = len(verts)
+    new_ib_count = len(faces) * 3
+
+    max_vc = lod0_block['vc']
+    max_ib_count = linear_block['ib_count']
+
+    if new_nv > max_vc:
+        raise ValueError(
+            f"Custom model has too many vertices ({new_nv} > {max_vc} max capacity). "
+            "Simplify/decimate or swap with a larger base model."
+        )
+    if new_ib_count > max_ib_count:
+        raise ValueError(
+            f"Custom model has too many indices ({new_ib_count} > {max_ib_count} max capacity). "
+            "Simplify/decimate or swap with a larger base model."
+        )
+
+    patched_gpu = bytearray(original_gpu_bytes)
+
+    s0 = _pack_stream0_dynamic(new_nv, stream0_stride, uvs=uvs)
+    if compute_normals:
+        normals = _compute_smooth_normals(verts, faces)
+        s1 = _pack_stream1_with_normals(verts, normals)
+    else:
+        s1 = _pack_stream1_zeroed(verts)
+
+    orig_s0_size = lod0_block['s0_size']
+    orig_s0_start = lod0_block['s0_start']
+    orig_s1_size = max_vc * 28
+
+    padded_s0 = bytearray(s0)
+    if len(padded_s0) < orig_s0_size:
+        last_record = s0[-stream0_stride:] if s0 else b'\x00' * stream0_stride
+        while len(padded_s0) < orig_s0_size:
+            padded_s0 += last_record
+        padded_s0 = padded_s0[:orig_s0_size]
+    patched_gpu[orig_s0_start : orig_s0_start + orig_s0_size] = padded_s0
+
+    padded_s1 = bytearray(s1)
+    if len(padded_s1) < orig_s1_size:
+        last_record = s1[-28:] if s1 else b'\x00' * 28
+        while len(padded_s1) < orig_s1_size:
+            padded_s1 += last_record
+        padded_s1 = padded_s1[:orig_s1_size]
+    orig_s1_start = orig_s0_start + orig_s0_size
+    patched_gpu[orig_s1_start : orig_s1_start + orig_s1_size] = padded_s1
+
+    ib = bytearray()
+    for f in faces:
+        ib += struct.pack('<HHH', f[0], f[1], f[2])
+    orig_ib_size = max_ib_count * 2
+    orig_ib_offset = linear_block['ib_offset']
+    padded_ib = bytearray(ib)
+    if len(padded_ib) < orig_ib_size:
+        padded_ib += original_gpu_bytes[orig_ib_offset + len(padded_ib) : orig_ib_offset + orig_ib_size]
+    patched_gpu[orig_ib_offset : orig_ib_offset + orig_ib_size] = padded_ib
+
+    index_count = new_ib_count
+
+    patched_primary = bytearray(original_primary_bytes)
+    for off in range(0, n_meta - 60, 4):
+        val = struct.unpack_from('<I', patched_primary, off)[0]
+        if val == 0x0B:
+            vc = struct.unpack_from('<I', patched_primary, off + 7*4)[0]
+            vc2 = struct.unpack_from('<I', patched_primary, off + 8*4)[0]
+            vc3 = struct.unpack_from('<I', patched_primary, off + 11*4)[0]
+            if vc == vc2 == vc3 and vc > 0 and vc == lod0_block['vc']:
+                rk = struct.unpack_from('<I', patched_primary, off + 14*4)[0]
+                if rk == 2:
+                    for field_index, value in [(7, new_nv), (8, new_nv), (11, new_nv), (13, index_count)]:
+                        struct.pack_into('<I', patched_primary, off + field_index * 4, value)
+                else:
+                    for field_index, value in [(7, new_nv), (8, new_nv), (11, new_nv)]:
+                        struct.pack_into('<I', patched_primary, off + field_index * 4, value)
+
+    return bytes(patched_gpu), bytes(patched_primary)
+
+
+# ============================================================
+# CIMR Multi-Submesh In-Place Replace
+# ============================================================
+
+def encode_primary_described_multi_submesh_replace(
+        original_gpu_bytes,
+        original_primary_bytes,
+        submesh_list,
+        stream0_stride=None,
+        compute_normals=True):
+    """
+    Multi-submesh CIMR replacement using 0x0B descriptor blocks.
+    Preserves original file offsets, sizes, and capacities exactly.
+    """
+    n_meta = len(original_primary_bytes)
+
+    ob_blocks = []
+    for off in range(0, n_meta - 60, 4):
+        val = struct.unpack_from('<I', original_primary_bytes, off)[0]
+        if val == 0x0B:
+            vc = struct.unpack_from('<I', original_primary_bytes, off + 7*4)[0]
+            vc2 = struct.unpack_from('<I', original_primary_bytes, off + 8*4)[0]
+            vc3 = struct.unpack_from('<I', original_primary_bytes, off + 11*4)[0]
+            if vc == vc2 == vc3 and vc > 0:
+                s0_sz = struct.unpack_from('<I', original_primary_bytes, off + 4*4)[0]
+                s0_start = struct.unpack_from('<I', original_primary_bytes, off + 2*4)[0]
+                rk = struct.unpack_from('<I', original_primary_bytes, off + 14*4)[0]
+                ib_offset = struct.unpack_from('<I', original_primary_bytes, off + 12*4)[0]
+                ib_cnt = struct.unpack_from('<I', original_primary_bytes, off + 13*4)[0]
+                fc = ib_cnt // 3 if rk == 2 else vc
+                ob_blocks.append((off, vc, s0_sz, s0_start, ib_offset, ib_cnt, fc, rk))
+
+    if not ob_blocks:
+        raise ValueError("No valid rendering blocks found in the original Primary template.")
+
+    if stream0_stride is None:
+        detected_stride = None
+        for _, vc, s0_sz, _, _, _, _, _ in ob_blocks:
+            if s0_sz % vc == 0:
+                cand = s0_sz // vc
+                if 12 <= cand <= 64:
+                    detected_stride = cand
+                    break
+        stream0_stride = detected_stride if detected_stride is not None else 16
+
+    processed_subs = []
+    for idx in range(len(ob_blocks)):
+        _, orig_vc, s0_sz, _, _, _, orig_fc, _ = ob_blocks[idx]
+        if idx < len(submesh_list):
+            sub = submesh_list[idx]
+            if len(sub) == 3:
+                verts, faces, uvs = sub
+            else:
+                verts, faces = sub
+                uvs = None
+        else:
+            verts = [(0.0, 0.0, 0.0)] * orig_vc
+            faces = [(0, 0, 0)] * orig_fc
+            uvs = [(0.0, 0.0)] * orig_vc
+        processed_subs.append((verts, faces, uvs))
+
+    patched_gpu = bytearray(original_gpu_bytes)
+    patched_primary = bytearray(original_primary_bytes)
+
+    submesh_offsets = []
+
+    for block_idx, (verts, faces, uvs) in enumerate(processed_subs):
+        allow_degen = (block_idx >= len(submesh_list))
+        _validate_mesh(verts, faces, f"multi_submesh_replace submesh {block_idx}", allow_degenerate=allow_degen)
+
+        new_nv = len(verts)
+        new_ib_count = len(faces) * 3
+
+        off_ob, orig_vc, orig_s0_size, orig_s0_start, orig_ib_offset, orig_ib_icount, orig_fc, rk = ob_blocks[block_idx]
+
+        if not allow_degen:
+            if new_nv > orig_vc:
+                raise ValueError(
+                    f"Custom Submesh {block_idx} has too many vertices ({new_nv} > {orig_vc} max capacity). "
+                    "Simplify/decimate or swap with a larger base model."
+                )
+            if new_ib_count > orig_ib_icount:
+                raise ValueError(
+                    f"Custom Submesh {block_idx} has too many indices ({new_ib_count} > {orig_ib_icount} max capacity). "
+                    "Simplify/decimate or swap with a larger base model."
+                )
+
+        s0 = _pack_stream0_dynamic(new_nv, stream0_stride, uvs=uvs)
+        padded_s0 = bytearray(s0)
+        if len(padded_s0) < orig_s0_size:
+            last_record = s0[-stream0_stride:] if s0 else b'\x00' * stream0_stride
+            while len(padded_s0) < orig_s0_size:
+                padded_s0 += last_record
+            padded_s0 = padded_s0[:orig_s0_size]
+        patched_gpu[orig_s0_start : orig_s0_start + orig_s0_size] = padded_s0
+
+        if compute_normals:
+            normals = _compute_smooth_normals(verts, faces)
+            s1 = _pack_stream1_with_normals(verts, normals)
+        else:
+            s1 = _pack_stream1_zeroed(verts)
+
+        orig_s1_size = orig_vc * 28
+        padded_s1 = bytearray(s1)
+        if len(padded_s1) < orig_s1_size:
+            last_record = s1[-28:] if s1 else b'\x00' * 28
+            while len(padded_s1) < orig_s1_size:
+                padded_s1 += last_record
+            padded_s1 = padded_s1[:orig_s1_size]
+        orig_s1_start = orig_s0_start + orig_s0_size
+        patched_gpu[orig_s1_start : orig_s1_start + orig_s1_size] = padded_s1
+
+        ib = bytearray()
+        for f in faces:
+            ib += struct.pack('<HHH', f[0], f[1], f[2])
+        orig_ib_size = orig_ib_icount * 2
+        padded_ib = bytearray(ib)
+        if len(padded_ib) < orig_ib_size:
+            padded_ib += b'\x00' * (orig_ib_size - len(padded_ib))
+        patched_gpu[orig_ib_offset : orig_ib_offset + orig_ib_size] = padded_ib
+
+        submesh_offsets.append((orig_s0_start, orig_s0_size, new_nv, orig_ib_offset, new_ib_count))
+
+    for off in range(0, n_meta - 60, 4):
+        val = struct.unpack_from('<I', patched_primary, off)[0]
+        if val == 0x0B:
+            vc = struct.unpack_from('<I', patched_primary, off + 7*4)[0]
+            vc2 = struct.unpack_from('<I', patched_primary, off + 8*4)[0]
+            vc3 = struct.unpack_from('<I', patched_primary, off + 11*4)[0]
+            if vc == vc2 == vc3 and vc > 0:
+                for block_idx, (_, orig_vc, _, _, _, _, _, _) in enumerate(ob_blocks):
+                    if orig_vc == vc and block_idx < len(submesh_offsets):
+                        _, _, new_nv, _, new_ib_count = submesh_offsets[block_idx]
+                        rk = struct.unpack_from('<I', patched_primary, off + 14*4)[0]
+                        if rk == 2:
+                            for fi, val in [(7, new_nv), (8, new_nv), (11, new_nv), (13, new_ib_count)]:
+                                struct.pack_into('<I', patched_primary, off + fi * 4, val)
+                        else:
+                            for fi, val in [(7, new_nv), (8, new_nv), (11, new_nv)]:
+                                struct.pack_into('<I', patched_primary, off + fi * 4, val)
+                        break
+
+    return bytes(patched_gpu), bytes(patched_primary)
+
+
+# ============================================================
+# Scale-only position patch
+# ============================================================
+
+def patch_primary_described_positions(original_gpu_bytes, original_primary_bytes,
+                                       scale_x=1.0, scale_y=1.0, scale_z=1.0):
+    """
+    Scale vertex positions in-place without rebuilding the GPU binary.
+    """
+    if len(original_primary_bytes) < 64:
+        raise ValueError(
+            f"Primary binary too short ({len(original_primary_bytes)} bytes); "
+            "expected at least 64 bytes (16 × uint32 descriptor)."
+        )
+
+    stream0_size = None
+    vertex_count = None
+
+    n_meta = len(original_primary_bytes)
+    for off in range(0, n_meta - 60, 4):
+        val = struct.unpack_from('<I', original_primary_bytes, off)[0]
+        if val == 0x0B:
+            vc = struct.unpack_from('<I', original_primary_bytes, off + 7*4)[0]
+            vc2 = struct.unpack_from('<I', original_primary_bytes, off + 8*4)[0]
+            vc3 = struct.unpack_from('<I', original_primary_bytes, off + 11*4)[0]
+            if vc == vc2 == vc3 and vc > 0:
+                fields = struct.unpack_from('<16I', original_primary_bytes, off)
+                stream0_size = fields[4]
+                vertex_count = fields[7]
+                break
+
+    if stream0_size is None or vertex_count is None:
+        fields = struct.unpack_from('<16I', original_primary_bytes, 0)
+        stream0_size = fields[4]
+        vertex_count = fields[7]
+
+    stream1_start = stream0_size
+    stream1_stride = 28
+    stream1_end = stream1_start + vertex_count * stream1_stride
+
+    gpu = len(original_gpu_bytes)
+    if stream1_end > gpu:
+        raise ValueError(
+            f"Primary descriptor says stream-1 ends at byte {stream1_end} "
+            f"but GPU binary is only {gpu} bytes. "
+            f"(stream0_size={stream0_size}, vertex_count={vertex_count})"
+        )
+
+    patched = bytearray(original_gpu_bytes)
+    for i in range(vertex_count):
+        base = stream1_start + i * stream1_stride
+        vx, vy, vz = struct.unpack_from('<fff', patched, base)
+        struct.pack_into('<fff', patched, base,
+                         vx * scale_x, vy * scale_y, vz * scale_z)
+
+    return bytes(patched), original_primary_bytes
+
+
+# ============================================================
 # Blender mesh extraction
 # ============================================================
 
 def mesh_from_blender_object(obj, apply_transforms=True, split_by_material=False):
     """
-    Extract (verts, faces) from a Blender mesh object.
-
-    Must be called from within a Blender operator context.
-
-    Args:
-        obj:               Blender Object with type == 'MESH'
-        apply_transforms:  apply world-space matrix before export
-        split_by_material: if True, return [(verts, faces), ...] split per
-                           material slot instead of a single merged mesh.
-                           Useful for CGML multi-submesh export.
-
-    Returns:
-        (verts, faces)  when split_by_material=False
-        [(verts, faces), ...]  when split_by_material=True
-
-    Raises:
-        ValueError if vertex count exceeds 65535 (uint16 limit).
+    Extract (verts, faces, uvs) from a Blender mesh object.
     """
     import bmesh
 
@@ -498,17 +862,14 @@ def mesh_from_blender_object(obj, apply_transforms=True, split_by_material=False
     if apply_transforms:
         bm.transform(obj.matrix_world)
 
-    # Triangulate in place — required for triangle-list IB
     bmesh.ops.triangulate(bm, faces=bm.faces[:])
-
-    # Try to get active UV layer
     uv_layer = bm.loops.layers.uv.active
 
     if not split_by_material:
         verts = [(v.co.x, v.co.y, v.co.z) for v in bm.verts]
         faces = [(f.verts[0].index, f.verts[1].index, f.verts[2].index)
                  for f in bm.faces]
-        
+
         uvs = []
         if uv_layer:
             for v in bm.verts:
@@ -528,7 +889,6 @@ def mesh_from_blender_object(obj, apply_transforms=True, split_by_material=False
             )
         return verts, faces, uvs
 
-    # Split by material index
     n_mats = max(len(obj.material_slots), 1)
     vert_maps = [dict() for _ in range(n_mats)]
     vert_lists = [[] for _ in range(n_mats)]
@@ -566,515 +926,3 @@ def mesh_from_blender_object(obj, apply_transforms=True, split_by_material=False
                 )
             result.append((vert_lists[i], face_lists[i], uv_lists[i]))
     return result
-
-
-def encode_primary_described_full_replace(
-        original_gpu_bytes,
-        original_primary_bytes,
-        verts,
-        faces,
-        uvs=None,
-        stream0_stride=None,
-        compute_normals=True):
-    """
-    Full mesh replacement for primary_described files using in-place swap.
-    Preserves original file offsets, sizes, and capacities exactly.
-    Ensures 100% stable mod loader / archive swaps in EchoVR (no stream out-of-bounds).
-    """
-    import struct
-
-    _validate_mesh(verts, faces, "primary_described_full_replace")
-
-    # Require the original Primary to be at least 64 bytes (the descriptor block).
-    if len(original_primary_bytes) < 64:
-        raise ValueError(
-            f"Original Primary is only {len(original_primary_bytes)} bytes. "
-            "Need at least 64 bytes (the 16-dword descriptor block)."
-        )
-
-    # Scan all valid rendering blocks in the template
-    blocks = []
-    n_meta = len(original_primary_bytes)
-    detected_stride = None
-    for off in range(0, n_meta - 60, 4):
-        val = struct.unpack_from('<I', original_primary_bytes, off)[0]
-        if val == 0x0B:
-            vc = struct.unpack_from('<I', original_primary_bytes, off + 7*4)[0]
-            vc2 = struct.unpack_from('<I', original_primary_bytes, off + 8*4)[0]
-            vc3 = struct.unpack_from('<I', original_primary_bytes, off + 11*4)[0]
-            if vc == vc2 == vc3 and vc > 0:
-                s0_start = struct.unpack_from('<I', original_primary_bytes, off + 2*4)[0]
-                s0_size = struct.unpack_from('<I', original_primary_bytes, off + 4*4)[0]
-                rk = struct.unpack_from('<I', original_primary_bytes, off + 14*4)[0]
-                ib_offset = struct.unpack_from('<I', original_primary_bytes, off + 12*4)[0]
-                ib_count = struct.unpack_from('<I', original_primary_bytes, off + 13*4)[0]
-                blocks.append({
-                    'off': off,
-                    'vc': vc,
-                    's0_start': s0_start,
-                    's0_size': s0_size,
-                    'rk': rk,
-                    'ib_offset': ib_offset,
-                    'ib_count': ib_count
-                })
-                if detected_stride is None and s0_size % vc == 0:
-                    cand = s0_size // vc
-                    if 12 <= cand <= 64:
-                        detected_stride = cand
-
-    if not blocks:
-        raise ValueError("No valid rendering blocks found in the original Primary template.")
-
-    # LOD0 block has the maximum original vertex count
-    lod0_block = max(blocks, key=lambda b: b['vc'])
-
-    # Find the linear block containing the real index parameters
-    linear_block = None
-    for b in blocks:
-        if b['rk'] == 2:
-            linear_block = b
-            break
-    if linear_block is None:
-        linear_block = lod0_block
-
-    # Default/fallback for stride
-    if stream0_stride is None:
-        stream0_stride = detected_stride if detected_stride is not None else 16
-
-    new_nv = len(verts)
-    new_ib_count = len(faces) * 3
-
-    max_vc = lod0_block['vc']
-    max_ib_count = linear_block['ib_count']
-
-    # Capacity checks
-    if new_nv > max_vc:
-        raise ValueError(
-            f"Custom model has too many vertices ({new_nv} > {max_vc} max capacity). "
-            "To fix this, simplify/decimate your custom mesh in Blender, or swap it with a larger in-game base model."
-        )
-    if new_ib_count > max_ib_count:
-        raise ValueError(
-            f"Custom model has too many indices ({new_ib_count} > {max_ib_count} max capacity). "
-            "To fix this, simplify/decimate your custom mesh in Blender, or swap it with a larger in-game base model."
-        )
-
-    # Initialize output bytearray to preserve original GPU size exactly
-    patched_gpu = bytearray(original_gpu_bytes)
-
-    # 1. Pack Stream 0 and Stream 1 dynamically
-    s0 = _pack_stream0_dynamic(new_nv, stream0_stride, uvs=uvs)
-    if compute_normals:
-        normals = _compute_smooth_normals(verts, faces)
-        s1 = _pack_stream1_with_normals(verts, normals)
-    else:
-        s1 = _pack_stream1_zeroed(verts)
-
-    orig_s0_size = lod0_block['s0_size']
-    orig_s0_start = lod0_block['s0_start']
-    orig_s1_size = max_vc * 28
-
-    # Overwrite Stream 0 in-place
-    padded_s0 = bytearray(s0)
-    if len(padded_s0) < orig_s0_size:
-        last_vertex_record = s0[-stream0_stride:] if s0 else b'\x00' * stream0_stride
-        while len(padded_s0) < orig_s0_size:
-            padded_s0 += last_vertex_record
-        padded_s0 = padded_s0[:orig_s0_size]
-    
-    patched_gpu[orig_s0_start : orig_s0_start + orig_s0_size] = padded_s0
-
-    # Overwrite Stream 1 in-place
-    padded_s1 = bytearray(s1)
-    if len(padded_s1) < orig_s1_size:
-        last_vertex_record = s1[-28:] if s1 else b'\x00' * 28
-        while len(padded_s1) < orig_s1_size:
-            padded_s1 += last_vertex_record
-        padded_s1 = padded_s1[:orig_s1_size]
-    
-    orig_s1_start = orig_s0_start + orig_s0_size
-    patched_gpu[orig_s1_start : orig_s1_start + orig_s1_size] = padded_s1
-
-    # 2. Overwrite Index Buffer
-    ib = bytearray()
-    for f in faces:
-        ib += struct.pack('<HHH', f[0], f[1], f[2])
-    
-    orig_ib_size = max_ib_count * 2
-    orig_ib_offset = linear_block['ib_offset']
-    padded_ib = bytearray(ib)
-    if len(padded_ib) < orig_ib_size:
-        # Preserve trailing index buffer bytes (for other LODs) rather than zero-padding
-        padded_ib += original_gpu_bytes[orig_ib_offset + len(padded_ib) : orig_ib_offset + orig_ib_size]
-    
-    patched_gpu[orig_ib_offset : orig_ib_offset + orig_ib_size] = padded_ib
-
-    index_offset  = orig_ib_offset
-    index_count   = new_ib_count
-
-    # Patch descriptor fields in ALL blocks in the original Primary template that correspond to LOD0.
-    patched_primary = bytearray(original_primary_bytes)
-    block_count = 0
-    for off in range(0, n_meta - 60, 4):
-        val = struct.unpack_from('<I', patched_primary, off)[0]
-        if val == 0x0B:
-            vc = struct.unpack_from('<I', patched_primary, off + 7*4)[0]
-            vc2 = struct.unpack_from('<I', patched_primary, off + 8*4)[0]
-            vc3 = struct.unpack_from('<I', patched_primary, off + 11*4)[0]
-            if vc == vc2 == vc3 and vc > 0:
-                if vc == lod0_block['vc']:
-                    rk = struct.unpack_from('<I', patched_primary, off + 14*4)[0]
-                    if rk == 2:
-                        # Linear block: update vertex counts and index count (do NOT change s0_size)
-                        for field_index, value in [
-                            (7,  new_nv),
-                            (8,  new_nv),
-                            (11, new_nv),
-                            (13, index_count),
-                        ]:
-                            struct.pack_into('<I', patched_primary, off + field_index * 4, value)
-                    else:
-                        # Cross-reference block: update vertex counts (do NOT change s0_size)
-                        for field_index, value in [
-                            (7,  new_nv),
-                            (8,  new_nv),
-                            (11, new_nv),
-                        ]:
-                            struct.pack_into('<I', patched_primary, off + field_index * 4, value)
-                    block_count += 1
-
-    return bytes(patched_gpu), bytes(patched_primary)
-
-
-def encode_primary_described_multi_submesh_replace(
-        original_gpu_bytes,
-        original_primary_bytes,
-        submesh_list,
-        stream0_stride=None,
-        compute_normals=True):
-    """
-    Surgically rebuild vertex/index buffers in-place inside the original GPU buffer layout.
-    Preserves original file offsets, sizes, and capacities exactly.
-    Ensures 100% stable mod loader / archive swaps in EchoVR (no stream out-of-bounds).
-    """
-    import struct
-
-    n_meta = len(original_primary_bytes)
-
-    # 1. Parse all descriptor, block, and structured array locations BEFORE patching
-    ob_blocks = []
-    for off in range(0, n_meta - 60, 4):
-        val = struct.unpack_from('<I', original_primary_bytes, off)[0]
-        if val == 0x0B:
-            vc = struct.unpack_from('<I', original_primary_bytes, off + 7*4)[0]
-            vc2 = struct.unpack_from('<I', original_primary_bytes, off + 8*4)[0]
-            vc3 = struct.unpack_from('<I', original_primary_bytes, off + 11*4)[0]
-            if vc == vc2 == vc3 and vc > 0:
-                s0_sz = struct.unpack_from('<I', original_primary_bytes, off + 4*4)[0]
-                rk = struct.unpack_from('<I', original_primary_bytes, off + 14*4)[0]
-                if rk == 2:
-                    ib_cnt = struct.unpack_from('<I', original_primary_bytes, off + 13*4)[0]
-                    fc = ib_cnt // 3
-                else:
-                    fc = vc
-                ob_blocks.append((off, vc, s0_sz, fc))
-
-    if not ob_blocks:
-        raise ValueError("No valid rendering blocks found in the original Primary template.")
-
-    # Structured arrays at the start of CGMeshListResource Primary files
-    sizes = (0x98, 0x70, 0x150, 0x150, 0x10, 0x10, 0x04, 0x04, 0x10, 0x18)
-    arrays = []
-    off = 0
-    for stride in sizes:
-        if off + 4 <= n_meta:
-            count = struct.unpack_from("<I", original_primary_bytes, off)[0]
-            base = off + 4
-            arrays.append((base, count, stride))
-            off = base + count * stride
-    tail_offset = off
-
-    if len(arrays) != 10:
-        raise ValueError("Original Primary template does not have a 10-array CGMeshListResource layout.")
-
-    array5_base, array5_count, _ = arrays[5]
-    array5_records = []
-    for idx in range(array5_count):
-        rec_off = array5_base + idx * 0x10
-        ib_off = struct.unpack_from('<I', original_primary_bytes, rec_off + 0x00)[0]
-        ib_sz = struct.unpack_from('<I', original_primary_bytes, rec_off + 0x04)[0]
-        array5_records.append((rec_off, ib_off, ib_sz))
-
-    # 0xFFFFFF0C descriptors scanned in CGMeshListResource fallback decoding path
-    descriptor_offs = []
-    for doff in range(0, n_meta - 0x40, 4):
-        vals = struct.unpack_from("<14I", original_primary_bytes, doff)
-        if vals[0] == 0xFFFFFF0C and vals[1] == 0xFFFFFFFF:
-            if vals[2] in (0x0B, 0x0D) and vals[3] == 0:
-                vertex_count = vals[9]
-                if vertex_count > 0 and vals[10] == vertex_count:
-                    descriptor_offs.append(doff)
-
-    # stream_records scanned in CGMeshListResource fallback decoding path
-    stream_record_offs = []
-    for soff in range(0, n_meta - 0x20, 0x08):
-        vals = struct.unpack_from("<8I", original_primary_bytes, soff)
-        if vals[0] == 4 and vals[2] and vals[4] and vals[5] in (0x2008, 0x2048):
-            stream_record_offs.append(soff)
-
-    # 2. Determine stride
-    if stream0_stride is None:
-        detected_stride = None
-        for off_ob, vc, s0_sz, fc in ob_blocks:
-            if s0_sz % vc == 0:
-                cand = s0_sz // vc
-                if 12 <= cand <= 64:
-                    detected_stride = cand
-                    break
-        stream0_stride = detected_stride if detected_stride is not None else 16
-
-    # 3. Match Blender submeshes to the expected blocks.
-    # If the user has fewer submeshes, we pad extra submeshes with clean dummy placeholder points.
-    processed_subs = []
-    for idx in range(len(ob_blocks)):
-        off_ob, orig_vc, s0_sz, orig_fc = ob_blocks[idx]
-        if idx < len(submesh_list):
-            sub = submesh_list[idx]
-            if len(sub) == 3:
-                verts, faces, uvs = sub
-            else:
-                verts, faces = sub
-                uvs = None
-        else:
-            verts = [(0.0, 0.0, 0.0)] * orig_vc
-            faces = [(0, 0, 0)] * orig_fc
-            uvs = [(0.0, 0.0)] * orig_vc
-            
-        processed_subs.append((verts, faces, uvs))
-
-    # Initialize output bytearrays to preserve original file sizes exactly
-    patched_gpu = bytearray(original_gpu_bytes)
-    patched_primary = bytearray(original_primary_bytes)
-
-    submesh_offsets = []
-
-    for block_idx, (verts, faces, uvs) in enumerate(processed_subs):
-        allow_degen = (block_idx >= len(submesh_list))
-        _validate_mesh(verts, faces, f"multi_submesh_replace submesh {block_idx}", allow_degenerate=allow_degen)
-        
-        new_nv = len(verts)
-        new_ib_count = len(faces) * 3
-
-        # Read original parameters from template
-        off_ob, orig_vc, orig_s0_size, orig_fc = ob_blocks[block_idx]
-        orig_s0_start = struct.unpack_from('<I', original_primary_bytes, off_ob + 2*4)[0]
-        rec_off_a5, orig_ib_offset, orig_ib_icount = array5_records[block_idx]
-
-        # Capacity checks
-        if not allow_degen:
-            if new_nv > orig_vc:
-                raise ValueError(
-                    f"Custom Submesh {block_idx} has too many vertices ({new_nv} > {orig_vc} max capacity). "
-                    "To fix this, simplify/decimate your custom mesh in Blender, or swap it with a larger in-game base model."
-                )
-            if new_ib_count > orig_ib_icount:
-                raise ValueError(
-                    f"Custom Submesh {block_idx} has too many indices ({new_ib_count} > {orig_ib_icount} max capacity). "
-                    "To fix this, simplify/decimate your custom mesh in Blender, or swap it with a larger in-game base model."
-                )
-
-        # 1. Overwrite Stream 0
-        s0 = _pack_stream0_dynamic(new_nv, stream0_stride, uvs=uvs)
-        # Pad s0 to orig_s0_size in-place
-        padded_s0 = bytearray(s0)
-        if len(padded_s0) < orig_s0_size:
-            last_vertex_record = s0[-stream0_stride:] if s0 else b'\x00' * stream0_stride
-            while len(padded_s0) < orig_s0_size:
-                padded_s0 += last_vertex_record
-            padded_s0 = padded_s0[:orig_s0_size]
-        
-        patched_gpu[orig_s0_start : orig_s0_start + orig_s0_size] = padded_s0
-
-        # 2. Overwrite Stream 1
-        if compute_normals:
-            normals = _compute_smooth_normals(verts, faces)
-            s1 = _pack_stream1_with_normals(verts, normals)
-        else:
-            s1 = _pack_stream1_zeroed(verts)
-        
-        orig_s1_size = orig_vc * 28
-        padded_s1 = bytearray(s1)
-        if len(padded_s1) < orig_s1_size:
-            last_vertex_record = s1[-28:] if s1 else b'\x00' * 28
-            while len(padded_s1) < orig_s1_size:
-                padded_s1 += last_vertex_record
-            padded_s1 = padded_s1[:orig_s1_size]
-        
-        orig_s1_start = orig_s0_start + orig_s0_size
-        patched_gpu[orig_s1_start : orig_s1_start + orig_s1_size] = padded_s1
-
-        # 3. Overwrite Index Buffer
-        ib = bytearray()
-        for f in faces:
-            ib += struct.pack('<HHH', f[0], f[1], f[2])
-        
-        orig_ib_size = orig_ib_icount * 2
-        padded_ib = bytearray(ib)
-        if len(padded_ib) < orig_ib_size:
-            padded_ib += b'\x00' * (orig_ib_size - len(padded_ib))
-        
-        patched_gpu[orig_ib_offset : orig_ib_offset + orig_ib_size] = padded_ib
-
-        # Since we patched in-place, the offsets remain EXACTLY the original values!
-        submesh_offsets.append((orig_s0_start, orig_s0_size, new_nv, orig_ib_offset, new_ib_count))
-
-    # 4. Patch Primary
-    # Patch structured arrays (if CGMeshListResource Primary structure matches exactly)
-    if len(arrays) == 10:
-        array1_base, array1_count, _ = arrays[1]
-        array2_base, array2_count, _ = arrays[2]
-        array5_base, array5_count, _ = arrays[5]
-
-        # Patch Array 1: Stream record vertex counts (including LODs/Shadows)
-        orig_block_vertex_counts = [block[1] for block in ob_blocks]
-        for r_idx in range(array1_count):
-            rec_off = array1_base + r_idx * 0x70
-            orig_vc = struct.unpack_from('<I', original_primary_bytes, rec_off + 0x48)[0]
-            for block_idx, orig_block_vc in enumerate(orig_block_vertex_counts):
-                if orig_vc == orig_block_vc:
-                    if block_idx < len(submesh_offsets):
-                        new_nv = submesh_offsets[block_idx][2]
-                        struct.pack_into('<I', patched_primary, rec_off + 0x48, new_nv)
-                        break
-
-        for block_index in range(min(len(submesh_offsets), array2_count)):
-            s0_start, s0_size, nv, ib_offset, ib_count = submesh_offsets[block_index]
-
-            # Array 2: Main mesh metadata record
-            rec_off = array2_base + block_index * 0x150
-            struct.pack_into('<I', patched_primary, rec_off + 0x128, s0_start)
-            struct.pack_into('<I', patched_primary, rec_off + 0x130, s0_size)
-            struct.pack_into('<I', patched_primary, rec_off + 0x13c, nv)
-            struct.pack_into('<I', patched_primary, rec_off + 0x140, nv)
-            struct.pack_into('<I', patched_primary, rec_off + 0x14c, nv)
-
-            # Array 5: Index buffer range metadata record
-            if block_index < array5_count:
-                rec_off = array5_base + block_index * 0x10
-                struct.pack_into('<I', patched_primary, rec_off + 0x00, ib_offset)
-                struct.pack_into('<I', patched_primary, rec_off + 0x04, ib_count)
-                struct.pack_into('<I', patched_primary, rec_off + 0x08, 2)
-                struct.pack_into('<I', patched_primary, rec_off + 0x0c, 0)
-
-    # Patch 0xFFFFFF0C descriptors (fallback path)
-    for block_index, doff in enumerate(descriptor_offs):
-        if block_index < len(submesh_offsets):
-            s0_start, s0_size, nv, ib_offset, ib_count = submesh_offsets[block_index]
-            struct.pack_into('<I', patched_primary, doff + 4*4, s0_start)
-            struct.pack_into('<I', patched_primary, doff + 6*4, s0_size)
-            struct.pack_into('<I', patched_primary, doff + 9*4, nv)
-            struct.pack_into('<I', patched_primary, doff + 10*4, nv)
-            struct.pack_into('<I', patched_primary, doff + 13*4, nv)
-
-    # Patch stream_records (fallback path)
-    for block_index, soff in enumerate(stream_record_offs):
-        if block_index < len(submesh_offsets):
-            s0_start, s0_size, nv, ib_offset, ib_count = submesh_offsets[block_index]
-            struct.pack_into('<I', patched_primary, soff + 2*4, nv)
-            struct.pack_into('<I', patched_primary, soff + 4*4, ib_count)
-
-    # Patch tail (CGMeshListResource files only)
-    if len(arrays) == 10 and tail_offset + 16 <= n_meta:
-        # Since we patch in-place, the ending offset and GPU size are both orig_gpu_size
-        orig_gpu_size = len(original_gpu_bytes)
-        struct.pack_into('<I', patched_primary, tail_offset + 4, orig_gpu_size)
-        struct.pack_into('<Q', patched_primary, tail_offset + 8, orig_gpu_size)
-
-    return bytes(patched_gpu), bytes(patched_primary)
-
-
-def patch_primary_described_positions(original_gpu_bytes, original_primary_bytes,
-                                       scale_x=1.0, scale_y=1.0, scale_z=1.0):
-    """
-    Scale vertex positions in-place without rebuilding the GPU binary.
-
-    For primary_described files, the game's resource manager reads buffer
-    offsets from the Primary file. If you rebuild the GPU binary from scratch
-    (via encode_primary_described), any file that has LOD data, shadow geometry,
-    or secondary vertex buffers after the main mesh will cause
-    'Offset is past end of stream' because the rebuilt binary is shorter.
-
-    This function instead:
-      1. Reads stream0_size and index_offset from the ORIGINAL Primary binary
-         to locate stream-1 (which contains the XYZ float32 positions)
-      2. Multiplies each vertex X/Y/Z by the given scale factors in-place.
-      3. Returns the modified GPU bytes at the EXACT same length as the original
-
-    The Primary binary is returned UNCHANGED because no offsets, counts,
-    or bounding-box fields need to change for a scale (the game
-    computes bounds at runtime from the vertex data).
-
-    Args:
-        original_gpu_bytes:     bytes — the original GPU file contents
-        original_primary_bytes: bytes — the original Primary file contents
-        scale_x, scale_y, scale_z: float scale multipliers per axis
-
-    Returns:
-        (patched_gpu_bytes, original_primary_bytes)
-    """
-    import struct
-
-    if len(original_primary_bytes) < 64:
-        raise ValueError(
-            f"Primary binary too short ({len(original_primary_bytes)} bytes); "
-            "expected at least 64 bytes (16 × uint32 descriptor)."
-        )
-
-    # Search for first 0x0B block to read stream0_size and vertex_count
-    stream0_size = None
-    vertex_count = None
-    
-    n_meta = len(original_primary_bytes)
-    for off in range(0, n_meta - 60, 4):
-        val = struct.unpack_from('<I', original_primary_bytes, off)[0]
-        if val == 0x0B:
-            vc = struct.unpack_from('<I', original_primary_bytes, off + 7*4)[0]
-            vc2 = struct.unpack_from('<I', original_primary_bytes, off + 8*4)[0]
-            vc3 = struct.unpack_from('<I', original_primary_bytes, off + 11*4)[0]
-            if vc == vc2 == vc3 and vc > 0:
-                fields = struct.unpack_from('<16I', original_primary_bytes, off)
-                stream0_size = fields[4]
-                vertex_count = fields[7]
-                break
-
-    if stream0_size is None or vertex_count is None:
-        # Fallback to absolute start of file
-        fields = struct.unpack_from('<16I', original_primary_bytes, 0)
-        stream0_size = fields[4]
-        vertex_count = fields[7]
-
-    # Validate that stream-1 fits inside the GPU binary
-    stream1_start = stream0_size
-    stream1_stride = 28         # always 28 in primary_described
-    stream1_end = stream1_start + vertex_count * stream1_stride
-
-    gpu = len(original_gpu_bytes)
-    if stream1_end > gpu:
-        raise ValueError(
-            f"Primary descriptor says stream-1 ends at byte {stream1_end} "
-            f"but GPU binary is only {gpu} bytes. "
-            f"(stream0_size={stream0_size}, vertex_count={vertex_count})"
-        )
-
-    # Patch positions in stream-1 (XYZ float32 at bytes 0-11 of each record)
-    patched = bytearray(original_gpu_bytes)
-    for i in range(vertex_count):
-        base = stream1_start + i * stream1_stride
-        vx, vy, vz = struct.unpack_from('<fff', patched, base)
-            
-        struct.pack_into('<fff', patched, base,
-                         vx * scale_x,
-                         vy * scale_y,
-                         vz * scale_z)
-
-    return bytes(patched), original_primary_bytes
