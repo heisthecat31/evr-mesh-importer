@@ -136,13 +136,22 @@ def _extract_submesh(data, s0_start, Nv, s0_stride):
     return verts, faces, uvs
 
 
+class DecodedSubmesh(tuple):
+    def __new__(cls, verts, faces, uvs, index_offset=0, group_id=None):
+        obj = tuple.__new__(cls, (verts, faces, uvs))
+        obj.index_offset = index_offset
+        obj.group_id = group_id
+        return obj
+
+
+
 # ============================================================
 # Primary-assisted CIMR paths
 # ============================================================
 
 def _extract_primary_described_cimr_mesh(gpu_data, primary_data):
-    """Decode CIMR GPU chunk using an exact Primary descriptor (range_kind=2).
-    Returns [(verts, faces)] or []."""
+    """Decode CIMR GPU chunk using exact Primary descriptors.
+    Returns [(verts, faces, uvs)] or []."""
     if not primary_data:
         return []
 
@@ -154,16 +163,8 @@ def _extract_primary_described_cimr_mesh(gpu_data, primary_data):
             return 0
         return struct.unpack_from("<I", meta, off)[0]
 
-    max_block_vc = 0
-    for _off in range(0, n_meta - 0x40 + 1, 4):
-        if u32(_off) != 0x0B:
-            continue
-        _vc = u32(_off + 7 * 4)
-        if _vc and u32(_off + 8 * 4) == _vc and u32(_off + 11 * 4) == _vc:
-            if _vc > max_block_vc:
-                max_block_vc = _vc
+    candidates = []
 
-    best = None
     for off in range(0, n_meta - 0x40 + 1, 4):
         if u32(off) != 0x0B:
             continue
@@ -181,8 +182,6 @@ def _extract_primary_described_cimr_mesh(gpu_data, primary_data):
         if range_kind != 2 or index_words < 3 or index_words % 3 != 0:
             continue
         if stream0_size not in (vertex_count * 16, vertex_count * 20) and not (stream0_size > 0 and (stream0_size % 16 == 0 or stream0_size % 20 == 0)):
-            continue
-        if base_offset != 0 and vertex_count < max_block_vc:
             continue
 
         if base_offset == 0:
@@ -207,6 +206,7 @@ def _extract_primary_described_cimr_mesh(gpu_data, primary_data):
         if base_offset != 0 and len(set(idxs)) < vertex_count:
             continue
 
+        best_cand_pos = None
         for pos_off in (0, 4, 8, 12, 16):
             verts = []
             valid = True
@@ -254,20 +254,65 @@ def _extract_primary_described_cimr_mesh(gpu_data, primary_data):
             else:
                 uvs = [(0.0, 0.0)] * vertex_count
 
-            candidate = (len(faces), vertex_count, -pos_off, verts, faces, uvs)
-            if best is None or candidate[:3] > best[:3]:
-                best = candidate
-            break
+            cand = {
+                "vertex_count": vertex_count,
+                "faces_count": len(faces),
+                "pos_off": pos_off,
+                "verts": verts,
+                "faces": faces,
+                "uvs": uvs,
+                "pos_start": pos_start,
+                "pos_end": pos_end,
+                "ib_start": index_offset,
+                "ib_end": index_offset + index_words * 2
+            }
+            if best_cand_pos is None or cand["faces_count"] > best_cand_pos["faces_count"]:
+                best_cand_pos = cand
+                
+        if best_cand_pos:
+            candidates.append(best_cand_pos)
 
-    if best is None:
-        return []
-    return [(best[3], best[4], best[5])]
+    # Sort candidates by vertex_count descending
+    candidates.sort(key=lambda c: c["vertex_count"], reverse=True)
+
+    accepted = []
+    accepted_v_ranges = []
+    accepted_i_ranges = []
+
+    def overlaps(s1, e1, s2, e2):
+        return max(s1, s2) < min(e1, e2)
+
+    for cand in candidates:
+        v_start, v_end = cand["pos_start"], cand["pos_end"]
+        i_start, i_end = cand["ib_start"], cand["ib_end"]
+
+        is_lod = False
+        for avs, ave in accepted_v_ranges:
+            if overlaps(v_start, v_end, avs, ave):
+                is_lod = True
+                break
+        if is_lod:
+            continue
+
+        for ais, aie in accepted_i_ranges:
+            if overlaps(i_start, i_end, ais, aie):
+                is_lod = True
+                break
+        if is_lod:
+            continue
+
+        accepted.append(cand)
+        accepted_v_ranges.append((v_start, v_end))
+        accepted_i_ranges.append((i_start, i_end))
+
+    accepted.sort(key=lambda c: c["pos_start"])
+    return [(c["verts"], c["faces"], c["uvs"]) for c in accepted]
 
 
 def _extract_hero_cimr_mesh(gpu_data, primary_data):
     """Decode CIMR GPU payloads using extended Primary descriptor rules.
-    Handles stride-28, multi-LOD (range_kind != 2), and small meshes.
-    Returns [(verts, faces)] or []."""
+    Handles stride-28, multi-LOD, and split submeshes.
+    Returns [(verts, faces, uvs)] or []."""
     if not primary_data:
         return []
 
@@ -279,7 +324,7 @@ def _extract_hero_cimr_mesh(gpu_data, primary_data):
             return 0
         return struct.unpack_from("<I", meta, off)[0]
 
-    best = None
+    candidates = []
 
     for off in range(0, n_meta - 0x40 + 1, 4):
         if u32(off) != 0x0B:
@@ -302,12 +347,16 @@ def _extract_hero_cimr_mesh(gpu_data, primary_data):
 
         # Scan forward from pos_end to find the start of the index buffer (skipping padding)
         ib_start = pos_end
+        found_ib = False
         for offset in range(pos_end, min(pos_end + 32768, len(gpu_data) - 6), 2):
             idx0, idx1, idx2 = struct.unpack_from("<HHH", gpu_data, offset)
             if idx0 < vertex_count and idx1 < vertex_count and idx2 < vertex_count:
                 if not (idx0 == idx1 or idx1 == idx2 or idx0 == idx2):
                     ib_start = offset
+                    found_ib = True
                     break
+        if not found_ib:
+            continue
 
         remaining = len(gpu_data) - ib_start
         max_scan = min(remaining // 2, vertex_count * 8)
@@ -323,6 +372,7 @@ def _extract_hero_cimr_mesh(gpu_data, primary_data):
 
         idxs = struct.unpack_from(f"<{n_valid}H", gpu_data, ib_start)
 
+        best_cand_pos = None
         for pos_off in (0, 4, 8, 12, 16):
             verts = []
             valid = True
@@ -353,7 +403,7 @@ def _extract_hero_cimr_mesh(gpu_data, primary_data):
                 if i0 == i1 or i1 == i2 or i0 == i2:
                     continue
                 faces.append((i0, i1, i2))
-            # Extract UVs from Stream-0
+            
             s0_start = base_offset
             s0_stride = stream0_size // vertex_count
             uvs = []
@@ -367,14 +417,59 @@ def _extract_hero_cimr_mesh(gpu_data, primary_data):
             else:
                 uvs = [(0.0, 0.0)] * vertex_count
 
-            candidate = (vertex_count, len(faces), -pos_off, verts, faces, uvs)
-            if best is None or candidate[:3] > best[:3]:
-                best = candidate
-            break
+            cand = {
+                "vertex_count": vertex_count,
+                "faces_count": len(faces),
+                "pos_off": pos_off,
+                "verts": verts,
+                "faces": faces,
+                "uvs": uvs,
+                "pos_start": pos_start,
+                "pos_end": pos_end,
+                "ib_start": ib_start,
+                "ib_end": ib_start + n_valid * 2
+            }
+            if best_cand_pos is None or cand["faces_count"] > best_cand_pos["faces_count"]:
+                best_cand_pos = cand
+                
+        if best_cand_pos:
+            candidates.append(best_cand_pos)
 
-    if best is None:
-        return []
-    return [(best[3], best[4], best[5])]
+    # Sort candidates by vertex_count descending
+    candidates.sort(key=lambda c: c["vertex_count"], reverse=True)
+
+    accepted = []
+    accepted_v_ranges = []
+    accepted_i_ranges = []
+
+    def overlaps(s1, e1, s2, e2):
+        return max(s1, s2) < min(e1, e2)
+
+    for cand in candidates:
+        v_start, v_end = cand["pos_start"], cand["pos_end"]
+        i_start, i_end = cand["ib_start"], cand["ib_end"]
+
+        is_lod = False
+        for avs, ave in accepted_v_ranges:
+            if overlaps(v_start, v_end, avs, ave):
+                is_lod = True
+                break
+        if is_lod:
+            continue
+
+        for ais, aie in accepted_i_ranges:
+            if overlaps(i_start, i_end, ais, aie):
+                is_lod = True
+                break
+        if is_lod:
+            continue
+
+        accepted.append(cand)
+        accepted_v_ranges.append((v_start, v_end))
+        accepted_i_ranges.append((i_start, i_end))
+
+    accepted.sort(key=lambda c: c["pos_start"])
+    return [(c["verts"], c["faces"], c["uvs"]) for c in accepted]
 
 
 def _extract_crossref_ib_cimr_mesh(gpu_data, primary_data):
@@ -747,13 +842,13 @@ def _extract_metadata_meshes(gpu_data, primary_data):
                         gpu_data, base_offset, stream0_size, vertex_count,
                         index_count, 28, index_offset)
                     if result is not None:
-                        submeshes.append(result)
+                        submeshes.append(DecodedSubmesh(result[0], result[1], result[2], index_offset, index_offset))
 
     if not submeshes:
         stream_records = []
         for soff in range(0, len(meta) - 0x20, 0x08):
             vals = [u32(soff + i * 4) for i in range(8)]
-            if vals[0] == 4 and vals[2] and vals[4] and vals[5] in (0x2008, 0x2048):
+            if vals[0] == 4 and vals[2] and vals[4] and vals[5] in (0x2008, 0x2048, 0x3008):
                 stream_records.append((vals[2], vals[4], vals[5], soff))
 
         descriptors = []
@@ -769,7 +864,7 @@ def _extract_metadata_meshes(gpu_data, primary_data):
             descriptors.append((doff, vals[4], vals[6], vertex_count))
 
         used_streams = [False] * len(stream_records)
-        for desc_idx, (_doff, base_offset, stream0_size, descriptor_vcount) in enumerate(descriptors):
+        for desc_idx, (doff, base_offset, stream0_size, descriptor_vcount) in enumerate(descriptors):
             vertex_count = descriptor_vcount
             stream_index = None
             for si, (record_vcount, _ic, _fmt, _ro) in enumerate(stream_records):
@@ -791,7 +886,18 @@ def _extract_metadata_meshes(gpu_data, primary_data):
             if result is None:
                 continue
             used_streams[stream_index] = True
-            submeshes.append(result)
+            
+            # Compute index offset & determine group ID
+            computed_idx_offset = idx_offset
+            if computed_idx_offset is None:
+                computed_idx_offset = base_offset + stream0_size + vertex_count * 28
+                
+            # Read descriptor extra dwords 14 and 15
+            extra_14 = u32(doff + 14 * 4)
+            extra_15 = u32(doff + 15 * 4)
+            group_id = f"{extra_14}_{extra_15}"
+            
+            submeshes.append(DecodedSubmesh(result[0], result[1], result[2], computed_idx_offset, group_id))
 
     if not submeshes:
         submeshes.extend(_decode_zero_tail_kind4_u32_cgml(meta, gpu_data))
@@ -1336,7 +1442,14 @@ def extract_mesh(gpu_filepath, primary_data=None, auto_find_primary=True):
     if primary_data:
         result = _extract_metadata_meshes(data, primary_data)
         if result:
-            return result, "cgml"
+            is_cgml = "CGMeshListResource" in gpu_filepath
+            if len(primary_data) >= 8:
+                dw0 = struct.unpack_from("<I", primary_data, 0)[0]
+                dw1 = struct.unpack_from("<I", primary_data, 4)[0]
+                if dw0 == 0 and dw1 == 0:
+                    is_cgml = False
+            label = "cgml" if is_cgml else "cginst"
+            return result, label
 
         result = _extract_primary_described_cimr_mesh(data, primary_data)
         if result:

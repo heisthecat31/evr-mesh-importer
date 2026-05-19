@@ -660,20 +660,36 @@ def encode_primary_described_multi_submesh_replace(
     n_meta = len(original_primary_bytes)
 
     ob_blocks = []
-    for off in range(0, n_meta - 60, 4):
-        val = struct.unpack_from('<I', original_primary_bytes, off)[0]
-        if val == 0x0B:
-            vc = struct.unpack_from('<I', original_primary_bytes, off + 7*4)[0]
-            vc2 = struct.unpack_from('<I', original_primary_bytes, off + 8*4)[0]
-            vc3 = struct.unpack_from('<I', original_primary_bytes, off + 11*4)[0]
-            if vc == vc2 == vc3 and vc > 0:
-                s0_sz = struct.unpack_from('<I', original_primary_bytes, off + 4*4)[0]
-                s0_start = struct.unpack_from('<I', original_primary_bytes, off + 2*4)[0]
-                rk = struct.unpack_from('<I', original_primary_bytes, off + 14*4)[0]
-                ib_offset = struct.unpack_from('<I', original_primary_bytes, off + 12*4)[0]
-                ib_cnt = struct.unpack_from('<I', original_primary_bytes, off + 13*4)[0]
-                fc = ib_cnt // 3 if rk == 2 else vc
-                ob_blocks.append((off, vc, s0_sz, s0_start, ib_offset, ib_cnt, fc, rk))
+    for off in range(0, n_meta - 56, 4):
+        vals = [struct.unpack_from("<I", original_primary_bytes, off + i*4)[0] for i in range(14)]
+        if vals[0] == 0xFFFFFF0C and vals[1] == 0xFFFFFFFF:
+            if vals[2] in (0x0B, 0x0D) and vals[3] == 0:
+                vc = vals[9]
+                vc2 = vals[10]
+                if vc == vc2 and vc > 0:
+                    s0_sz = vals[6]
+                    s0_start = vals[4]
+                    
+                    # Determine rk and ib_cnt
+                    rk = 0
+                    ib_cnt = vc
+                    for soff in range(0, n_meta - 0x20, 0x08):
+                        svals = [struct.unpack_from("<I", original_primary_bytes, soff + i*4)[0] for i in range(8)]
+                        if svals[0] == 4 and svals[2] == vc and svals[4] > 0 and svals[5] in (0x2008, 0x2048, 0x3008):
+                            ib_cnt = svals[4]
+                            rk = 2
+                            break
+                            
+                    # Determine ib_offset
+                    # Check if the template contains a non-zero index offset at the descriptor's relative offset:
+                    desc_ib_offset = struct.unpack_from('<I', original_primary_bytes, off + 12*4)[0]
+                    if 0 < desc_ib_offset < len(original_gpu_bytes):
+                        ib_offset = desc_ib_offset
+                    else:
+                        ib_offset = s0_start + s0_sz + vc * 28
+                        
+                    fc = ib_cnt // 3 if rk == 2 else vc
+                    ob_blocks.append((off, vc, s0_sz, s0_start, ib_offset, ib_cnt, fc, rk))
 
     if not ob_blocks:
         raise ValueError("No valid rendering blocks found in the original Primary template.")

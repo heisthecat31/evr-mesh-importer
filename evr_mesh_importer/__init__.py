@@ -38,6 +38,7 @@ from bpy.types import Operator
 
 from .decode import extract_mesh
 from .primary import _find_primary_data
+from .textures import apply_textures_to_objects
 from .encode import (
     encode_heuristic_s16,
     encode_heuristic_s20,
@@ -102,24 +103,57 @@ def _is_cgml_primary(primary_bytes):
 
 def _detect_s0_stride_from_primary(primary_bytes):
     """
-    Scan 0x0B descriptor blocks in a Primary file to determine the
+    Scan 0xFFFFFF0C descriptor blocks in a Primary file to determine the
     stream-0 stride used by the original mesh.
     
     Returns the stride (e.g. 16, 20) or None if undetectable.
     """
     n_meta = len(primary_bytes)
-    for off in range(0, n_meta - 60, 4):
-        val = struct.unpack_from('<I', primary_bytes, off)[0]
-        if val == 0x0B:
-            vc = struct.unpack_from('<I', primary_bytes, off + 7*4)[0]
-            vc2 = struct.unpack_from('<I', primary_bytes, off + 8*4)[0]
-            vc3 = struct.unpack_from('<I', primary_bytes, off + 11*4)[0]
-            if vc == vc2 == vc3 and vc > 0:
-                s0_size = struct.unpack_from('<I', primary_bytes, off + 4*4)[0]
-                if vc > 0 and s0_size % vc == 0:
-                    stride = s0_size // vc
-                    if stride in (12, 16, 20, 24, 28, 32, 44):
-                        return stride
+    for off in range(0, n_meta - 56, 4):
+        vals = [struct.unpack_from("<I", primary_bytes, off + i*4)[0] for i in range(14)]
+        if vals[0] == 0xFFFFFF0C and vals[1] == 0xFFFFFFFF:
+            if vals[2] in (0x0B, 0x0D) and vals[3] == 0:
+                vc = vals[9]
+                vc2 = vals[10]
+                if vc == vc2 and vc > 0:
+                    s0_size = vals[6]
+                    if s0_size % vc == 0:
+                        stride = s0_size // vc
+                        if stride in (12, 16, 20, 24, 28, 32, 44):
+                            return stride
+    return None
+ 
+ 
+def _detect_cgml_stride(primary_bytes):
+    """
+    Detect stream-0 stride from a CGML Primary file's Array 2 descriptor.
+    
+    Returns the stride (e.g. 16, 20, 44) or None if undetectable.
+    """
+    n_meta = len(primary_bytes)
+    sizes = (0x98, 0x70, 0x150, 0x150, 0x10, 0x10, 0x04, 0x04, 0x10, 0x18)
+    off = 0
+    arrays = []
+    for stride in sizes:
+        if off + 4 > n_meta:
+            return None
+        count = struct.unpack_from("<I", primary_bytes, off)[0]
+        base = off + 4
+        end = base + count * stride
+        if end > n_meta:
+            return None
+        arrays.append((base, count, stride))
+        off = end
+        
+    if len(arrays) == 10 and arrays[2][1] > 0:
+        a2_base, a2_count, a2_stride = arrays[2]
+        rec_off = a2_base
+        s0_size = struct.unpack_from("<I", primary_bytes, rec_off + 0x130)[0]
+        vc = struct.unpack_from("<I", primary_bytes, rec_off + 0x13c)[0]
+        if vc > 0 and s0_size % vc == 0:
+            stride = s0_size // vc
+            if 12 <= stride <= 64:
+                return stride
     return None
 
 
@@ -218,8 +252,37 @@ class EVR_OT_ImportMesh(Operator, ImportHelper):
         soft_max=100.0,
     )
 
+    pcvr_extracted_dir: StringProperty(
+        name="pcvr-extracted Folder",
+        description=(
+            "Optional. Path to the pcvr-extracted directory containing 'c2434c5a99e139ce'. "
+            "Leave blank to auto-discover."
+        ),
+        default="",
+        subtype='DIR_PATH',
+    )
+
+    texture_cache_dir: StringProperty(
+        name="Texture Cache Folder",
+        description=(
+            "Optional. Path to the texture_cache directory containing high-res PNGs. "
+            "Leave blank to auto-discover."
+        ),
+        default="",
+        subtype='DIR_PATH',
+    )
+
+    import_lods: BoolProperty(
+        name="Import LODs",
+        description="Import lower-detail Level of Detail (LOD) meshes overlaying the primary mesh",
+        default=False,
+    )
+
+
     @classmethod
     def poll(cls, context):
+        if bpy.app.background:
+            return True
         return context.area is not None
 
     def execute(self, context):
@@ -273,6 +336,41 @@ class EVR_OT_ImportMesh(Operator, ImportHelper):
             self.report({'WARNING'}, f"{os.path.basename(gpu_path)}: no geometry decoded.")
             return None
 
+        # Universal LOD Deduplication
+        if not self.import_lods and path_label == "cginst":
+            groups = {}
+            for idx, sub in enumerate(submeshes):
+                group_id = getattr(sub, "group_id", None)
+                if isinstance(group_id, str) and "_" in group_id:
+                    comp_id = group_id.split("_")[0]
+                    if comp_id not in groups:
+                        groups[comp_id] = []
+                    groups[comp_id].append(sub)
+                else:
+                    unique_id = f"unique_{idx}"
+                    groups[unique_id] = [sub]
+
+            deduped = []
+            for comp_id, group in groups.items():
+                best_sub = max(group, key=lambda s: len(s[0]))
+                deduped.append(best_sub)
+
+            submeshes = deduped
+
+        # Build logical material index map based on submesh group IDs to correctly support multi-material models
+        # Preserve original order of appearance to avoid alphabetical sorting bugs
+        unique_group_ids = []
+        for sub in submeshes:
+            group_id = getattr(sub, "group_id", None)
+            if group_id is None:
+                group_id = getattr(sub, "index_offset", None)
+            if group_id is None:
+                group_id = len(sub[1]) if len(sub) > 1 else 0
+            if group_id not in unique_group_ids:
+                unique_group_ids.append(group_id)
+
+        group_id_to_mat_idx = {gid: i for i, gid in enumerate(unique_group_ids)}
+
         base_name = os.path.splitext(os.path.basename(gpu_path))[0]
         valid = [(sub[0], sub[1]) for sub in submeshes if len(sub) >= 2 and sub[0] and sub[1]]
 
@@ -301,6 +399,15 @@ class EVR_OT_ImportMesh(Operator, ImportHelper):
             name = base_name if parent_empty is None else f"{base_name}.{idx:03d}"
             obj = _build_blender_mesh(verts, faces, name)
 
+            # Store logical material index on the object to ensure correct texture assignment in apply_textures_to_objects
+            group_id = getattr(sub, "group_id", None)
+            if group_id is None:
+                group_id = getattr(sub, "index_offset", None)
+            if group_id is None:
+                group_id = len(sub[1]) if len(sub) > 1 else idx
+            obj["evr_material_index"] = group_id_to_mat_idx.get(group_id, 0)
+
+
             if uvs and obj.data:
                 uv_layer = obj.data.uv_layers.new(name="UVMap")
                 for poly in obj.data.polygons:
@@ -308,7 +415,9 @@ class EVR_OT_ImportMesh(Operator, ImportHelper):
                         loop = obj.data.loops[loop_idx]
                         v_idx = loop.vertex_index
                         if v_idx < len(uvs):
-                            uv_layer.data[loop_idx].uv = uvs[v_idx]
+                            # Flip the V-coordinate (1.0 - V) for correct Blender viewport texturing
+                            uv_layer.data[loop_idx].uv = (uvs[v_idx][0], 1.0 - uvs[v_idx][1])
+                obj.data["evr_uv_flipped"] = True
 
             if not self.use_smooth:
                 _apply_flat_shading(obj)
@@ -328,6 +437,20 @@ class EVR_OT_ImportMesh(Operator, ImportHelper):
             f"{base_name}: {len(created)} mesh(es) {total_tris}f [{path_label}]",
         )
 
+        # Automatically map PBR textures to imported meshes
+        model_hash = base_name.split('.')[0]
+        try:
+            mats_count = apply_textures_to_objects(
+                model_hash=model_hash,
+                pcvr_extracted_dir=self.pcvr_extracted_dir,
+                texture_cache_dir=self.texture_cache_dir,
+                target_objects=created
+            )
+            if mats_count > 0:
+                self.report({'INFO'}, f"Successfully applied {mats_count} PBR materials to mesh.")
+        except Exception as e:
+            self.report({'WARNING'}, f"Failed to auto-apply PBR textures: {e}")
+
         return parent_empty if parent_empty is not None else created[0]
 
     def draw(self, context):
@@ -337,6 +460,10 @@ class EVR_OT_ImportMesh(Operator, ImportHelper):
         layout.separator()
         layout.prop(self, "use_smooth")
         layout.prop(self, "scale")
+        layout.separator()
+        layout.label(text="PBR Textures (Optional):")
+        layout.prop(self, "pcvr_extracted_dir")
+        layout.prop(self, "texture_cache_dir")
 
 
 def menu_func_import(self, context):
@@ -537,14 +664,16 @@ class EVR_OT_ExportMesh(Operator, ExportHelper):
                         "Expected at least 64 bytes for a valid descriptor.")
                     return {'CANCELLED'}
 
-                # Auto-detect stride if needed
-                if s0_stride is None:
-                    s0_stride = _detect_s0_stride_from_primary(orig_primary)
-                    if s0_stride is None:
-                        s0_stride = 16  # safe fallback
-
                 # ---- DETECT: CGML or CIMR? ----
                 is_cgml = _is_cgml_primary(orig_primary)
+                # Auto-detect stride if needed
+                if s0_stride is None:
+                    if is_cgml:
+                        s0_stride = _detect_cgml_stride(orig_primary)
+                    else:
+                        s0_stride = _detect_s0_stride_from_primary(orig_primary)
+                    if s0_stride is None:
+                        s0_stride = 16  # safe fallback
 
                 try:
                     if is_cgml:
