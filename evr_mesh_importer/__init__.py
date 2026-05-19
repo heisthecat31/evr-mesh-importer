@@ -7,7 +7,7 @@ https://github.com/Dualgame/evr-mesh-importer
 bl_info = {
     "name": "EVR Raw Mesh Importer",
     "author": "Dualgame",
-    "version": (1, 1, 1),
+    "version": (1, 1, 0),
     "blender": (3, 0, 0),
     "location": "File > Import/Export > EVR Raw Mesh",
     "description": "Import/export raw GPU mesh binaries from Echo VR (Echo Arena)",
@@ -20,7 +20,6 @@ import bpy
 import os
 import sys
 import importlib
-import struct
 
 # Support reloading submodules to prevent import errors when upgrading the addon in Blender
 _submodules = ["decode", "primary", "encode"]
@@ -38,147 +37,15 @@ from bpy.types import Operator
 
 from .decode import extract_mesh
 from .primary import _find_primary_data
-from .textures import apply_textures_to_objects
 from .encode import (
     encode_heuristic_s16,
     encode_heuristic_s20,
     encode_heuristic_dual28,
     encode_primary_described,
     encode_cgml,
-    encode_cgml_inplace_replace,  # ADD THIS
     mesh_from_blender_object,
-    encode_primary_described_full_replace,
-    encode_primary_described_multi_submesh_replace,
-    patch_primary_described_positions,
 )
 
-# ============================================================
-# Helper: detect if a Primary file is CGMeshListResource
-# ============================================================
-
-def _is_cgml_primary(primary_bytes):
-    """
-    Detect whether a Primary binary belongs to a CGMeshListResource (CGML)
-    as opposed to a CGInstancedModelResource (CIMR).
-    
-    CGML Primary files have a distinctive 10-array structured layout at the
-    beginning, followed by a tail signature. CIMR files have raw 0x0B
-    descriptor blocks scattered throughout.
-    
-    Returns True if the Primary appears to be CGML.
-    """
-    n_meta = len(primary_bytes)
-    if n_meta < 0x310:
-        return False
-    
-    # CGML files have a 10-array layout with these strides
-    sizes = (0x98, 0x70, 0x150, 0x150, 0x10, 0x10, 0x04, 0x04, 0x10, 0x18)
-    off = 0
-    for stride in sizes:
-        if off + 4 > n_meta:
-            return False
-        count = struct.unpack_from("<I", primary_bytes, off)[0]
-        # Sanity: count should be reasonable
-        if count > 1000:
-            return False
-        base = off + 4
-        end = base + count * stride
-        if end > n_meta:
-            return False
-        off = end
-    
-    # After the 10 arrays, there should be a tail with signature
-    if off + 16 <= n_meta:
-        tail_a, mesh_data_end, gpu_size = struct.unpack_from("<IIQ", primary_bytes, off)
-        # tail_a is typically 0 or 5 for valid CGML
-        if tail_a in (0, 5) and gpu_size > 0:
-            return True
-    
-    return False
-
-
-# ============================================================
-# Helper: detect stream-0 stride from a Primary file
-# ============================================================
-
-def _detect_s0_stride_from_primary(primary_bytes):
-    """
-    Scan 0xFFFFFF0C descriptor blocks in a Primary file to determine the
-    stream-0 stride used by the original mesh.
-    
-    Returns the stride (e.g. 16, 20) or None if undetectable.
-    """
-    n_meta = len(primary_bytes)
-    for off in range(0, n_meta - 56, 4):
-        vals = [struct.unpack_from("<I", primary_bytes, off + i*4)[0] for i in range(14)]
-        if vals[0] == 0xFFFFFF0C and vals[1] == 0xFFFFFFFF:
-            if vals[2] in (0x0B, 0x0D) and vals[3] == 0:
-                vc = vals[9]
-                vc2 = vals[10]
-                if vc == vc2 and vc > 0:
-                    s0_size = vals[6]
-                    if s0_size % vc == 0:
-                        stride = s0_size // vc
-                        if stride in (12, 16, 20, 24, 28, 32, 44):
-                            return stride
-    return None
- 
- 
-def _detect_cgml_stride(primary_bytes):
-    """
-    Detect stream-0 stride from a CGML Primary file's Array 2 descriptor.
-    
-    Returns the stride (e.g. 16, 20, 44) or None if undetectable.
-    """
-    n_meta = len(primary_bytes)
-    sizes = (0x98, 0x70, 0x150, 0x150, 0x10, 0x10, 0x04, 0x04, 0x10, 0x18)
-    off = 0
-    arrays = []
-    for stride in sizes:
-        if off + 4 > n_meta:
-            return None
-        count = struct.unpack_from("<I", primary_bytes, off)[0]
-        base = off + 4
-        end = base + count * stride
-        if end > n_meta:
-            return None
-        arrays.append((base, count, stride))
-        off = end
-        
-    if len(arrays) == 10 and arrays[2][1] > 0:
-        a2_base, a2_count, a2_stride = arrays[2]
-        rec_off = a2_base
-        s0_size = struct.unpack_from("<I", primary_bytes, rec_off + 0x130)[0]
-        vc = struct.unpack_from("<I", primary_bytes, rec_off + 0x13c)[0]
-        if vc > 0 and s0_size % vc == 0:
-            stride = s0_size // vc
-            if 12 <= stride <= 64:
-                return stride
-    return None
-
-
-# ============================================================
-# Helper: count rendering blocks in a CIMR Primary file
-# ============================================================
-
-def _count_cimr_blocks(primary_bytes):
-    """Count the number of 0x0B rendering blocks in a CIMR Primary file."""
-    n_meta = len(primary_bytes)
-    count = 0
-    for off in range(0, n_meta - 60, 4):
-        val = struct.unpack_from('<I', primary_bytes, off)[0]
-        if val == 0x0B:
-            vc = struct.unpack_from('<I', primary_bytes, off + 7*4)[0]
-            vc2 = struct.unpack_from('<I', primary_bytes, off + 8*4)[0]
-            vc3 = struct.unpack_from('<I', primary_bytes, off + 11*4)[0]
-            if vc == vc2 == vc3 and vc > 0:
-                count += 1
-    return count
-
-
-# ============================================================
-# Mesh building helper
-# ============================================================
 
 def _build_blender_mesh(verts, faces, name):
     mesh = bpy.data.meshes.new(name)
@@ -193,10 +60,6 @@ def _apply_flat_shading(obj):
     for poly in obj.data.polygons:
         poly.use_smooth = False
 
-
-# ============================================================
-# Import operator
-# ============================================================
 
 class EVR_OT_ImportMesh(Operator, ImportHelper):
     """Import a raw EVR GPU mesh binary (CIMR, CGML, or heuristic)"""
@@ -252,37 +115,8 @@ class EVR_OT_ImportMesh(Operator, ImportHelper):
         soft_max=100.0,
     )
 
-    pcvr_extracted_dir: StringProperty(
-        name="pcvr-extracted Folder",
-        description=(
-            "Optional. Path to the pcvr-extracted directory containing 'c2434c5a99e139ce'. "
-            "Leave blank to auto-discover."
-        ),
-        default="",
-        subtype='DIR_PATH',
-    )
-
-    texture_cache_dir: StringProperty(
-        name="Texture Cache Folder",
-        description=(
-            "Optional. Path to the texture_cache directory containing high-res PNGs. "
-            "Leave blank to auto-discover."
-        ),
-        default="",
-        subtype='DIR_PATH',
-    )
-
-    import_lods: BoolProperty(
-        name="Import LODs",
-        description="Import lower-detail Level of Detail (LOD) meshes overlaying the primary mesh",
-        default=False,
-    )
-
-
     @classmethod
     def poll(cls, context):
-        if bpy.app.background:
-            return True
         return context.area is not None
 
     def execute(self, context):
@@ -336,41 +170,6 @@ class EVR_OT_ImportMesh(Operator, ImportHelper):
             self.report({'WARNING'}, f"{os.path.basename(gpu_path)}: no geometry decoded.")
             return None
 
-        # Universal LOD Deduplication
-        if not self.import_lods and path_label == "cginst":
-            groups = {}
-            for idx, sub in enumerate(submeshes):
-                group_id = getattr(sub, "group_id", None)
-                if isinstance(group_id, str) and "_" in group_id:
-                    comp_id = group_id.split("_")[0]
-                    if comp_id not in groups:
-                        groups[comp_id] = []
-                    groups[comp_id].append(sub)
-                else:
-                    unique_id = f"unique_{idx}"
-                    groups[unique_id] = [sub]
-
-            deduped = []
-            for comp_id, group in groups.items():
-                best_sub = max(group, key=lambda s: len(s[0]))
-                deduped.append(best_sub)
-
-            submeshes = deduped
-
-        # Build logical material index map based on submesh group IDs to correctly support multi-material models
-        # Preserve original order of appearance to avoid alphabetical sorting bugs
-        unique_group_ids = []
-        for sub in submeshes:
-            group_id = getattr(sub, "group_id", None)
-            if group_id is None:
-                group_id = getattr(sub, "index_offset", None)
-            if group_id is None:
-                group_id = len(sub[1]) if len(sub) > 1 else 0
-            if group_id not in unique_group_ids:
-                unique_group_ids.append(group_id)
-
-        group_id_to_mat_idx = {gid: i for i, gid in enumerate(unique_group_ids)}
-
         base_name = os.path.splitext(os.path.basename(gpu_path))[0]
         valid = [(sub[0], sub[1]) for sub in submeshes if len(sub) >= 2 and sub[0] and sub[1]]
 
@@ -399,15 +198,7 @@ class EVR_OT_ImportMesh(Operator, ImportHelper):
             name = base_name if parent_empty is None else f"{base_name}.{idx:03d}"
             obj = _build_blender_mesh(verts, faces, name)
 
-            # Store logical material index on the object to ensure correct texture assignment in apply_textures_to_objects
-            group_id = getattr(sub, "group_id", None)
-            if group_id is None:
-                group_id = getattr(sub, "index_offset", None)
-            if group_id is None:
-                group_id = len(sub[1]) if len(sub) > 1 else idx
-            obj["evr_material_index"] = group_id_to_mat_idx.get(group_id, 0)
-
-
+            # Assign UVs if present in the imported data
             if uvs and obj.data:
                 uv_layer = obj.data.uv_layers.new(name="UVMap")
                 for poly in obj.data.polygons:
@@ -415,9 +206,7 @@ class EVR_OT_ImportMesh(Operator, ImportHelper):
                         loop = obj.data.loops[loop_idx]
                         v_idx = loop.vertex_index
                         if v_idx < len(uvs):
-                            # Flip the V-coordinate (1.0 - V) for correct Blender viewport texturing
-                            uv_layer.data[loop_idx].uv = (uvs[v_idx][0], 1.0 - uvs[v_idx][1])
-                obj.data["evr_uv_flipped"] = True
+                            uv_layer.data[loop_idx].uv = uvs[v_idx]
 
             if not self.use_smooth:
                 _apply_flat_shading(obj)
@@ -437,20 +226,6 @@ class EVR_OT_ImportMesh(Operator, ImportHelper):
             f"{base_name}: {len(created)} mesh(es) {total_tris}f [{path_label}]",
         )
 
-        # Automatically map PBR textures to imported meshes
-        model_hash = base_name.split('.')[0]
-        try:
-            mats_count = apply_textures_to_objects(
-                model_hash=model_hash,
-                pcvr_extracted_dir=self.pcvr_extracted_dir,
-                texture_cache_dir=self.texture_cache_dir,
-                target_objects=created
-            )
-            if mats_count > 0:
-                self.report({'INFO'}, f"Successfully applied {mats_count} PBR materials to mesh.")
-        except Exception as e:
-            self.report({'WARNING'}, f"Failed to auto-apply PBR textures: {e}")
-
         return parent_empty if parent_empty is not None else created[0]
 
     def draw(self, context):
@@ -460,10 +235,6 @@ class EVR_OT_ImportMesh(Operator, ImportHelper):
         layout.separator()
         layout.prop(self, "use_smooth")
         layout.prop(self, "scale")
-        layout.separator()
-        layout.label(text="PBR Textures (Optional):")
-        layout.prop(self, "pcvr_extracted_dir")
-        layout.prop(self, "texture_cache_dir")
 
 
 def menu_func_import(self, context):
@@ -480,9 +251,11 @@ class EVR_OT_ExportMesh(Operator, ExportHelper):
     bl_label = "EVR Raw Mesh (Replace)"
     bl_options = {'REGISTER', 'UNDO'}
 
-    filename_ext = ""
+    # ExportHelper sets self.filepath from this
+    filename_ext = ""   # EVR binaries have no extension
     filter_glob: StringProperty(default="*", options={'HIDDEN'}, maxlen=255)
 
+    # ---- encode mode ----
     encode_mode: EnumProperty(
         name="Encode Mode",
         description=(
@@ -499,21 +272,21 @@ class EVR_OT_ExportMesh(Operator, ExportHelper):
             ('heuristic_dual28', "Heuristic — dual-28 (0xFF prefix both streams)",
              "Both stream-0 and stream-1 use stride-28. "
              "Use for files decoded via _extract_dual28_prefixed_mesh."),
-            ('primary_described', "Primary Described (auto-detect CGML/CIMR, in-place patch)",
-             "Automatically detects whether the original is CGML or CIMR and "
-             "surgically patches the GPU + Primary files in-place. "
-             "Safest option for all model types."),
-            ('primary_described_patch', "Primary Described (Scale Only)",
-             "Surgically scales vertex positions inside the original GPU binary in-place, "
+            ('primary_described', "Primary Described (also writes Primary file)",
+             "Most accurate. Also writes a matching Primary binary alongside "
+             "the GPU file. Use for files decoded as 'primary_described'."),
+            ('primary_described_patch', "Primary Described (In-place Patch)",
+             "Surgically patches vertex positions inside the original GPU binary in-place, "
              "leaving file size and LODs/shadow geometry completely original. "
              "Use to prevent load crashes on complex instanced props."),
-            ('cgml',            "CGML — map geometry (multi-submesh, new file)",
+            ('cgml',            "CGML — map geometry (multi-submesh)",
              "Encodes each material slot as a separate submesh. "
-             "Writes a new standalone GPU binary without patching the Primary."),
+             "Use for CGMeshListResource map files."),
         ],
-        default='primary_described',
+        default='heuristic_s16',
     )
 
+    # ---- stream-1 options ----
     compute_normals: BoolProperty(
         name="Compute Normals",
         description=(
@@ -524,27 +297,29 @@ class EVR_OT_ExportMesh(Operator, ExportHelper):
         default=True,
     )
 
+    # ---- primary options (primary_described mode only) ----
     write_primary: BoolProperty(
         name="Write Primary File",
         description=(
             "Also write a matching Primary binary to the sibling Primary/ "
-            "directory. Required for 'primary_described' mode."
+            "directory. Required for 'primary_described' mode. The importer "
+            "uses the same directory convention for auto-discovery."
         ),
         default=True,
     )
 
     stream0_stride: EnumProperty(
         name="Stream-0 Stride",
-        description="Stride of the original file's stream-0 (Auto-detect, 16, 20, or 44 bytes).",
+        description="Stride of the original file's stream-0 (Auto-detect, 16, or 20 bytes).",
         items=[
             ('auto', "Auto-Detect", "Automatically detect from the original Primary template file"),
             ('16', "16 bytes", "Original used stride-16 stream-0"),
             ('20', "20 bytes", "Original used stride-20 stream-0"),
-            ('44', "44 bytes", "Original used stride-44 stream-0 (props/environment)"),
         ],
         default='auto',
     )
 
+    # ---- transform ----
     scale: FloatProperty(
         name="Scale",
         description="Uniform scale applied to all vertex positions before export",
@@ -584,40 +359,36 @@ class EVR_OT_ExportMesh(Operator, ExportHelper):
 
         # ---- extract geometry from Blender ----
         try:
-            if self.encode_mode in ('cgml',):
-                # CGML new-file mode: split by material
+            if self.encode_mode == 'cgml':
                 submeshes = mesh_from_blender_object(
                     obj, apply_transforms=True, split_by_material=True)
                 if not submeshes:
                     self.report({'ERROR'}, "No geometry found in material slots.")
                     return {'CANCELLED'}
             else:
-                # All other modes: single mesh
                 verts, faces, uvs = mesh_from_blender_object(
                     obj, apply_transforms=True, split_by_material=False)
         except ValueError as e:
             self.report({'ERROR'}, str(e))
             return {'CANCELLED'}
 
-        # ---- apply uniform scale (non-patch modes) ----
-        if self.encode_mode not in ('primary_described_patch',):
+        # ---- apply scale ----
+        if self.encode_mode == 'cgml':
             if self.scale != 1.0:
                 s = self.scale
-                if self.encode_mode == 'cgml':
-                    submeshes = [
-                        ([(x*s, y*s, z*s) for x, y, z in v], f, u)
-                        for v, f, u in submeshes
-                    ]
-                else:
-                    verts = [(x*s, y*s, z*s) for x, y, z in verts]
+                submeshes = [
+                    ([(x*s, y*s, z*s) for x, y, z in v], f, u)
+                    for v, f, u in submeshes
+                ]
+        else:
+            if self.scale != 1.0:
+                s = self.scale
+                verts = [(x*s, y*s, z*s) for x, y, z in verts]
 
         # ---- encode ----
         try:
             cn = self.compute_normals
 
-            # ================================================================
-            # HEURISTIC MODES (no Primary file needed)
-            # ================================================================
             if self.encode_mode == 'heuristic_s16':
                 gpu_data = encode_heuristic_s16(verts, faces, uvs=uvs, compute_normals=cn)
                 self._write_gpu(out_path, gpu_data)
@@ -633,154 +404,100 @@ class EVR_OT_ExportMesh(Operator, ExportHelper):
                 self._write_gpu(out_path, gpu_data)
                 self._report_ok(obj.name, verts, faces, out_path)
 
-            # ================================================================
-            # PRIMARY DESCRIBED (in-place patch, auto-detect CGML vs CIMR)
-            # ================================================================
             elif self.encode_mode == 'primary_described':
                 s0_stride = None if self.stream0_stride == 'auto' else int(self.stream0_stride)
                 gpu_path = out_path
                 from .primary import _find_primary_path
                 primary_path = _find_primary_path(gpu_path)
-
-                if not primary_path or not os.path.exists(primary_path):
-                    self.report({'ERROR'},
-                        "Could not find sibling Primary file. "
-                        "Ensure the original Primary file exists alongside the GPU file, "
-                        "or use a heuristic encode mode instead.")
-                    return {'CANCELLED'}
-
-                if not os.path.exists(gpu_path):
-                    self.report({'ERROR'}, f"Original GPU file not found: {gpu_path}")
-                    return {'CANCELLED'}
-
-                with open(gpu_path, 'rb') as f:
-                    orig_gpu = f.read()
-                with open(primary_path, 'rb') as f:
-                    orig_primary = f.read()
-
-                if len(orig_primary) < 64:
-                    self.report({'ERROR'},
-                        f"Primary file is too small ({len(orig_primary)} bytes). "
-                        "Expected at least 64 bytes for a valid descriptor.")
-                    return {'CANCELLED'}
-
-                # ---- DETECT: CGML or CIMR? ----
-                is_cgml = _is_cgml_primary(orig_primary)
-                # Auto-detect stride if needed
-                if s0_stride is None:
-                    if is_cgml:
-                        s0_stride = _detect_cgml_stride(orig_primary)
-                    else:
-                        s0_stride = _detect_s0_stride_from_primary(orig_primary)
-                    if s0_stride is None:
-                        s0_stride = 16  # safe fallback
-
-                try:
-                    if is_cgml:
-                        # CGML path: get Blender submeshes split by material
-                        submesh_list = mesh_from_blender_object(
-                            obj, apply_transforms=True, split_by_material=True)
+                
+                patched = False
+                if primary_path and os.path.exists(primary_path) and os.path.exists(gpu_path):
+                    with open(gpu_path, 'rb') as f:
+                        orig_gpu = f.read()
+                    with open(primary_path, 'rb') as f:
+                        orig_primary = f.read()
+                    
+                    if len(orig_primary) > 64:
+                        # Count how many rendering blocks are in the original Primary template
+                        block_count = 0
+                        import struct
+                        n_meta = len(orig_primary)
+                        for off in range(0, n_meta - 60, 4):
+                            val = struct.unpack_from('<I', orig_primary, off)[0]
+                            if val == 0x0B:
+                                vc = struct.unpack_from('<I', orig_primary, off + 7*4)[0]
+                                vc2 = struct.unpack_from('<I', orig_primary, off + 8*4)[0]
+                                vc3 = struct.unpack_from('<I', orig_primary, off + 11*4)[0]
+                                if vc == vc2 == vc3 and vc > 0:
+                                    block_count += 1
                         
-                        if not submesh_list:
-                            self.report({'ERROR'}, "No geometry found in mesh.")
-                            return {'CANCELLED'}
-                        
-                        # Count Array 2 entries for reporting
-                        num_slots = 0
-                        off = 0
-                        sizes = (0x98, 0x70, 0x150, 0x150, 0x10, 0x10, 0x04, 0x04, 0x10, 0x18)
-                        for idx, stride in enumerate(sizes):
-                            if off + 4 > len(orig_primary):
-                                break
-                            count = struct.unpack_from("<I", orig_primary, off)[0]
-                            if idx == 2:
-                                num_slots = count
-                            off = off + 4 + count * stride
-                        
-                        gpu_data, primary_data = encode_cgml_inplace_replace(
-                            orig_gpu, orig_primary,
-                            submesh_list,
-                            stream0_stride=s0_stride,
-                            compute_normals=cn
-                        )
-                        self._write_gpu(gpu_path, gpu_data)
-                        with open(primary_path, 'wb') as f:
-                            f.write(primary_data)
-                        
-                        first_sub = submesh_list[0]
-                        first_verts = first_sub[0] if len(first_sub) >= 1 else []
-                        first_faces = first_sub[1] if len(first_sub) >= 2 else []
-                        self.report({'INFO'},
-                            f"CGML patched: {len(first_verts)}v {len(first_faces)}f "
-                            f"×{num_slots} slots → "
-                            f"{os.path.basename(primary_path)}")
-                        patched = True
-                    else:
-                        # CIMR path: check if multi-block
-                        block_count = _count_cimr_blocks(orig_primary)
-                        if block_count > 1:
-                            # Multi-block CIMR (LODs, shadow geometry, etc.)
-                            submesh_list = mesh_from_blender_object(
-                                obj, apply_transforms=True, split_by_material=True)
-                            gpu_data, primary_data = encode_primary_described_multi_submesh_replace(
-                                orig_gpu, orig_primary,
-                                submesh_list,
-                                stream0_stride=s0_stride,
-                                compute_normals=cn
-                            )
-                            self.report({'INFO'},
-                                f"CIMR multi-block patched: {block_count} blocks, "
-                                f"{len(submesh_list)} material submeshes → "
-                                f"{os.path.basename(primary_path)}")
+                        try:
+                            if block_count > 1:
+                                # Multi-submesh prop model!
+                                submesh_list = mesh_from_blender_object(
+                                    obj, apply_transforms=True, split_by_material=True)
+                                from .encode import encode_primary_described_multi_submesh_replace
+                                gpu_data, primary_data = encode_primary_described_multi_submesh_replace(
+                                    orig_gpu, orig_primary,
+                                    submesh_list,
+                                    stream0_stride=s0_stride,
+                                    compute_normals=cn
+                                )
+                                self.report({'INFO'}, f"Auto-detected multi-submesh prop ({block_count} submeshes).")
+                            else:
+                                # Single-submesh hero/cosmetic model
+                                from .encode import encode_primary_described_full_replace
+                                gpu_data, primary_data = encode_primary_described_full_replace(
+                                    orig_gpu, orig_primary,
+                                    verts, faces, uvs=uvs,
+                                    stream0_stride=s0_stride,
+                                    compute_normals=cn
+                                )
+                            
+                            self._write_gpu(gpu_path, gpu_data)
+                            with open(primary_path, 'wb') as f:
+                                f.write(primary_data)
+                            self.report({'INFO'}, f"Wrote rebuilt GPU and patched original Primary template in-place: {os.path.basename(primary_path)}")
+                            patched = True
+                        except Exception as e:
+                            self.report({'WARNING'}, f"Template-based replacement failed: {e}. Falling back to standard export.")
+                
+                if not patched:
+                    gpu_data, primary_data = encode_primary_described(
+                        verts, faces, uvs=uvs, stream0_stride=s0_stride, compute_normals=cn)
+                    self._write_gpu(gpu_path, gpu_data)
+                    if self.write_primary:
+                        ppath = self._primary_sibling_path(gpu_path)
+                        if ppath:
+                            os.makedirs(os.path.dirname(ppath), exist_ok=True)
+                            with open(ppath, 'wb') as f:
+                                f.write(primary_data)
+                            self.report({'INFO'}, f"Wrote rebuilt GPU and clean 64-byte Primary descriptor: {os.path.basename(ppath)}")
                         else:
-                            # Single-block CIMR (simple prop/hero)
-                            gpu_data, primary_data = encode_primary_described_full_replace(
-                                orig_gpu, orig_primary,
-                                verts, faces, uvs=uvs,
-                                stream0_stride=s0_stride,
-                                compute_normals=cn
-                            )
-                            self.report({'INFO'},
-                                f"CIMR single-block patched: {len(verts)}v {len(faces)}f → "
-                                f"{os.path.basename(primary_path)}")
+                            self.report({'WARNING'}, "Could not determine Primary path from GPU path. Primary skipped.")
+                    else:
+                        self._report_ok(obj.name, verts, faces, gpu_path)
 
-                        self._write_gpu(gpu_path, gpu_data)
-                        with open(primary_path, 'wb') as f:
-                            f.write(primary_data)
-                        patched = True
-
-                except ValueError as e:
-                    self.report({'ERROR'}, f"Patch failed: {e}")
-                    return {'CANCELLED'}
-                except Exception as e:
-                    self.report({'ERROR'}, f"Unexpected error during patch: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    return {'CANCELLED'}
-
-            # ================================================================
-            # PRIMARY DESCRIBED PATCH (scale only, no geometry change)
-            # ================================================================
             elif self.encode_mode == 'primary_described_patch':
                 gpu_path = out_path
                 from .primary import _find_primary_path
                 primary_path = _find_primary_path(gpu_path)
-
+                
                 if not primary_path or not os.path.exists(primary_path):
-                    self.report({'ERROR'},
-                        "Could not locate sibling Primary file. "
-                        "Ensure the original Primary file is in the corresponding sibling hash directory.")
+                    self.report({'ERROR'}, "Could not locate sibling Primary file via auto-discovery. "
+                                           "Ensure the original Primary file is in the corresponding sibling hash directory.")
                     return {'CANCELLED'}
-
+                
                 if not os.path.exists(gpu_path):
                     self.report({'ERROR'}, f"Original GPU file not found: {gpu_path}")
                     return {'CANCELLED'}
-
+                
                 with open(gpu_path, 'rb') as f:
                     orig_gpu = f.read()
                 with open(primary_path, 'rb') as f:
                     orig_primary = f.read()
-
+                
+                from .encode import patch_primary_described_positions
                 try:
                     patched_gpu, _ = patch_primary_described_positions(
                         orig_gpu, orig_primary,
@@ -791,15 +508,11 @@ class EVR_OT_ExportMesh(Operator, ExportHelper):
                 except ValueError as e:
                     self.report({'ERROR'}, f"In-place patch failed: {e}")
                     return {'CANCELLED'}
-
+                
                 self._write_gpu(gpu_path, patched_gpu)
-                self.report({'INFO'},
-                    f"Scaled vertex positions in {os.path.basename(gpu_path)}. "
-                    f"Primary file untouched.")
+                self.report({'INFO'}, f"Surgically scaled vertex positions in {os.path.basename(gpu_path)}. "
+                                      f"Primary file remained untouched.")
 
-            # ================================================================
-            # CGML (new file, no patching)
-            # ================================================================
             elif self.encode_mode == 'cgml':
                 gpu_data = encode_cgml(submeshes, compute_normals=cn)
                 self._write_gpu(out_path, gpu_data)
@@ -831,6 +544,7 @@ class EVR_OT_ExportMesh(Operator, ExportHelper):
     def _primary_sibling_path(self, gpu_path):
         """
         Mirror the GPU path to the sibling Primary directory.
+        Supports both flat hash layout (e7a8ab5ceaef49cb -> 37102e4b27955a14) and nested layout.
         """
         fname = os.path.basename(gpu_path)
         parent = os.path.dirname(gpu_path)
@@ -846,12 +560,12 @@ class EVR_OT_ExportMesh(Operator, ExportHelper):
         parent_folder = os.path.basename(parent)
         primary_folder = gpu_to_primary.get(parent_folder, "37102e4b27955a14")
 
-        # 1. Flat hash layout
+        # 1. Flat hash layout: any/parent/fname -> any/sibling/fname
         candidate1 = os.path.join(grandparent, primary_folder, fname)
         if os.path.isdir(os.path.dirname(candidate1)):
             return candidate1
 
-        # 2. Nested hash layout
+        # 2. Nested hash layout: any/GPU/parent/fname -> any/Primary/sibling/fname
         candidate2 = os.path.join(ggp, "Primary", primary_folder, fname)
         if os.path.isdir(os.path.dirname(candidate2)) or os.path.basename(grandparent) == "GPU":
             return candidate2
@@ -897,10 +611,6 @@ class EVR_OT_ExportMesh(Operator, ExportHelper):
 def menu_func_export(self, context):
     self.layout.operator(EVR_OT_ExportMesh.bl_idname, text="EVR Raw Mesh (Replace)")
 
-
-# ============================================================
-# Registration
-# ============================================================
 
 def register():
     bpy.utils.register_class(EVR_OT_ImportMesh)
