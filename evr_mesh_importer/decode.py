@@ -123,6 +123,9 @@ def _extract_submesh(data, s0_start, Nv, s0_stride):
         faces.append((i0, i1, i2))
 
     uvs = []
+    bone_data = []
+    has_valid_bones = False
+
     if s0_stride >= 16:
         for j in range(Nv):
             s0_off = s0_start + j * s0_stride
@@ -130,10 +133,22 @@ def _extract_submesh(data, s0_start, Nv, s0_stride):
             if not (math.isfinite(u) and math.isfinite(v)):
                 u, v = 0.0, 0.0
             uvs.append((u, v))
+
+            # Extract Bone Weights (Stream 0: bytes 0-3) and Bone Indices (Stream 1: bytes 20-23)
+            weights = struct.unpack_from("<4B", data, s0_off)
+            indices = struct.unpack_from("<4B", data, s1_start + j * 28 + 20)
+            bone_data.append((indices, weights))
+
+            if sum(weights) > 50:
+                has_valid_bones = True
     else:
         uvs = [(0.0, 0.0)] * Nv
+        bone_data = [((0,0,0,0), (0,0,0,0))] * Nv
 
-    return verts, faces, uvs
+    if not has_valid_bones:
+        bone_data = None
+
+    return verts, faces, uvs, bone_data
 
 
 # ============================================================
@@ -244,6 +259,9 @@ def _extract_primary_described_cimr_mesh(gpu_data, primary_data):
             s0_start = base_offset
             s0_stride = stream0_size // vertex_count
             uvs = []
+            bone_data = []
+            has_valid_bones = False
+            
             if s0_stride >= 16:
                 for j in range(vertex_count):
                     s0_off = s0_start + j * s0_stride
@@ -251,17 +269,29 @@ def _extract_primary_described_cimr_mesh(gpu_data, primary_data):
                     if not (math.isfinite(u) and math.isfinite(v)):
                         u, v = 0.0, 0.0
                     uvs.append((u, v))
+                    
+                    weights = struct.unpack_from("<4B", gpu_data, s0_off)
+                    indices = struct.unpack_from("<4B", gpu_data, pos_start + j * 28 + pos_off + 20)
+                    bone_data.append((indices, weights))
+                    if sum(weights) > 50:
+                        has_valid_bones = True
             else:
                 uvs = [(0.0, 0.0)] * vertex_count
+                bone_data = [((0,0,0,0), (0,0,0,0))] * vertex_count
 
-            candidate = (len(faces), vertex_count, -pos_off, verts, faces, uvs)
+            if not has_valid_bones:
+                bone_data = None
+            else:
+                print('Found valid bones!')
+
+            candidate = (len(faces), vertex_count, -pos_off, verts, faces, uvs, bone_data)
             if best is None or candidate[:3] > best[:3]:
                 best = candidate
             break
 
     if best is None:
         return []
-    return [(best[3], best[4], best[5])]
+    return [(best[3], best[4], best[5], best[6])]
 
 
 def _extract_hero_cimr_mesh(gpu_data, primary_data):
@@ -507,12 +537,12 @@ def _extract_crossref_ib_cimr_mesh(gpu_data, primary_data):
 # ============================================================
 
 def _extract_cgml_ranges(gpu_data, base_offset, stream0_size, vertex_count,
-                         index_count, pos_stride, index_offset=None):
+                         index_count, pos_stride, index_offset=None, index_stride=2):
     pos_start = base_offset + stream0_size
     ib_start = index_offset if index_offset is not None else pos_start + vertex_count * pos_stride
     if pos_start + vertex_count * pos_stride > len(gpu_data):
         return None
-    if ib_start + index_count * 2 > len(gpu_data):
+    if ib_start + index_count * index_stride > len(gpu_data):
         return None
     verts = []
     for j in range(vertex_count):
@@ -524,16 +554,26 @@ def _extract_cgml_ranges(gpu_data, base_offset, stream0_size, vertex_count,
         verts.append((x, y, z))
 
     faces = []
-    for k in range(0, index_count - index_count % 3, 3):
-        i0, i1, i2 = struct.unpack_from("<HHH", gpu_data, ib_start + k * 2)
-        if i0 >= vertex_count or i1 >= vertex_count or i2 >= vertex_count:
-            return None
-        faces.append((i0, i1, i2))
+    if index_stride == 4:
+        for k in range(0, index_count - index_count % 3, 3):
+            i0, i1, i2 = struct.unpack_from("<III", gpu_data, ib_start + k * 4)
+            if i0 >= vertex_count or i1 >= vertex_count or i2 >= vertex_count:
+                return None
+            faces.append((i0, i1, i2))
+    else:
+        for k in range(0, index_count - index_count % 3, 3):
+            i0, i1, i2 = struct.unpack_from("<HHH", gpu_data, ib_start + k * 2)
+            if i0 >= vertex_count or i1 >= vertex_count or i2 >= vertex_count:
+                return None
+            faces.append((i0, i1, i2))
     if not faces:
         return None
 
     s0_stride = stream0_size // vertex_count if vertex_count else 16
     uvs = []
+    bone_data = []
+    has_valid_bones = False
+    
     if s0_stride >= 16:
         for j in range(vertex_count):
             s0_off = base_offset + j * s0_stride
@@ -541,10 +581,28 @@ def _extract_cgml_ranges(gpu_data, base_offset, stream0_size, vertex_count,
             if not (math.isfinite(u) and math.isfinite(v)):
                 u, v = 0.0, 0.0
             uvs.append((u, v))
+            
+            if s0_stride >= 24:
+                indices = struct.unpack_from("<4B", gpu_data, s0_off + s0_stride - 8)
+                weights = struct.unpack_from("<4B", gpu_data, s0_off + s0_stride - 4)
+            elif s0_stride == 20:
+                weights = struct.unpack_from("<4B", gpu_data, s0_off)
+                indices = struct.unpack_from("<4B", gpu_data, s0_off + 4)
+            else:
+                weights = struct.unpack_from("<4B", gpu_data, s0_off)
+                indices = struct.unpack_from("<4B", gpu_data, ib_start - vertex_count * 28 + j * 28 + 16)
+            
+            bone_data.append((indices, weights))
+            if sum(weights) > 50:
+                has_valid_bones = True
     else:
         uvs = [(0.0, 0.0)] * vertex_count
+        bone_data = [((0,0,0,0), (0,0,0,0))] * vertex_count
 
-    return verts, faces, uvs
+    if not has_valid_bones:
+        bone_data = None
+
+    return verts, faces, uvs, bone_data
 
 
 def _decode_compact_cgml(meta, gpu_data):
@@ -587,7 +645,7 @@ def _decode_compact_cgml(meta, gpu_data):
     result = _extract_cgml_ranges(gpu_data, 0, stream0_size, nv, n_idx, pos_stride, ib_start_gpu)
     if result is None:
         return []
-    verts, faces = result
+    verts, faces, _ = result
     if not faces:
         return []
     return [(verts, faces)]
@@ -699,35 +757,38 @@ def _extract_metadata_meshes(gpu_data, primary_data):
 
     if arrays and len(meta) - off >= 16:
         tail_a, mesh_data_end, gpu_size = struct.unpack_from("<IIQ", meta, off)
-        if tail_a == 5 and gpu_size == len(gpu_data) and 0 < mesh_data_end <= len(gpu_data):
-            array1_base, _, _ = arrays[1]
+        if gpu_size == len(gpu_data) and (mesh_data_end <= len(gpu_data)):
+            array1_base, array1_count, _ = arrays[1]
             array2_base, array2_count, _ = arrays[2]
             array5_base, array5_count, _ = arrays[5]
             if array2_count == array5_count:
                 for i in range(array2_count):
                     rec_off = array2_base + i * 0x150
-                    stream_rec_off = array1_base + i * 0x70
                     range_rec_off = array5_base + i * 0x10
 
                     base_offset = struct.unpack_from("<I", meta, rec_off + 0x128)[0]
                     stream0_size = struct.unpack_from("<I", meta, rec_off + 0x130)[0]
                     vertex_count = struct.unpack_from("<I", meta, rec_off + 0x13c)[0]
                     vertex_count_2 = struct.unpack_from("<I", meta, rec_off + 0x140)[0]
-                    stream_vertex_count = struct.unpack_from("<I", meta, stream_rec_off + 0x48)[0]
                     index_offset, index_size, range_kind, range_extra = struct.unpack_from(
                         "<IIII", meta, range_rec_off)
 
                     if vertex_count == 0 or vertex_count_2 != vertex_count:
                         continue
-                    if stream_vertex_count != vertex_count:
-                        continue
-                    if range_kind != 2 or range_extra != 0 or index_size == 0:
+                    # Cross-check with array1 stream record when arrays are parallel
+                    if array1_count == array2_count and i < array1_count:
+                        stream_rec_off = array1_base + i * 0x70
+                        stream_vertex_count = struct.unpack_from("<I", meta, stream_rec_off + 0x48)[0]
+                        if stream_vertex_count != vertex_count:
+                            continue
+                    if range_kind not in (2, 4) or range_extra != 0 or index_size == 0:
                         continue
 
-                    index_count = index_size // 2
+                    index_stride = 4 if range_kind == 4 else 2
+                    index_count = index_size
                     result = _extract_cgml_ranges(
                         gpu_data, base_offset, stream0_size, vertex_count,
-                        index_count, 28, index_offset)
+                        index_count, 28, index_offset, index_stride)
                     if result is not None:
                         submeshes.append(result)
 
@@ -769,11 +830,395 @@ def _extract_metadata_meshes(gpu_data, primary_data):
             submeshes.append(result)
 
     if not submeshes:
+        submeshes.extend(_decode_scan_metadata_fallback(meta, gpu_data))
+    if not submeshes:
         submeshes.extend(_decode_zero_tail_kind4_u32_cgml(meta, gpu_data))
     if not submeshes:
         submeshes.extend(_decode_compact_cgml(meta, gpu_data))
+    if not submeshes:
+        submeshes.extend(_decode_summer_heuristics(meta, gpu_data))
 
     return submeshes
+
+
+def _decode_scan_metadata_fallback(meta, gpu_data):
+    """Fallback decoder using signature scan and sequential pairing.
+    Returns [(verts, faces, uvs), ...] or []."""
+    n_meta = len(meta)
+    if n_meta < 64:
+        return []
+
+    def u32(off):
+        if off < 0 or off + 4 > n_meta:
+            return 0
+        return struct.unpack_from("<I", meta, off)[0]
+
+    # 1. Find descriptors
+    descriptors = []
+    for off in range(0, n_meta - 64 + 1, 4):
+        if u32(off) == 0xffffff0c and u32(off + 4) == 0xffffffff:
+            kind = u32(off + 8)
+            if kind in (11, 13) and u32(off + 12) == 0:
+                base_offset = u32(off + 16)
+                stream0_size = u32(off + 24)
+                vertex_count = u32(off + 36)
+                if vertex_count > 0 and u32(off + 40) == vertex_count:
+                    descriptors.append({
+                        'doff': off,
+                        'base_offset': base_offset,
+                        'stream0_size': stream0_size,
+                        'vertex_count': vertex_count
+                    })
+
+    # Sort descriptors by offset in file (original order)
+    descriptors = sorted(descriptors, key=lambda d: d['doff'])
+
+    # 2. Find index records
+    index_records = []
+    for off in range(0, n_meta - 16 + 1, 4):
+        idx_off, idx_count, r_kind, r_extra = struct.unpack_from("<IIII", meta, off)
+        if r_kind in (2, 4) and r_extra == 0 and idx_count >= 3 and idx_off >= 1024 and idx_off % 2 == 0:
+            idx_stride = 2 if r_kind == 2 else 4
+            if idx_off + idx_count * idx_stride <= len(gpu_data):
+                index_records.append({
+                    'ioff': off,
+                    'idx_off': idx_off,
+                    'idx_count': idx_count,
+                    'idx_stride': idx_stride
+                })
+
+    # Sort index records by offset in file
+    index_records = sorted(index_records, key=lambda ir: ir['ioff'])
+
+    if not descriptors or not index_records:
+        return []
+
+    submeshes = []
+    # Pair them by order
+    for idx in range(min(len(descriptors), len(index_records))):
+        desc = descriptors[idx]
+        irec = index_records[idx]
+
+        vertex_count = desc['vertex_count']
+        index_count = irec['idx_count']
+        index_offset = irec['idx_off']
+        index_stride = irec['idx_stride']
+        base_offset = desc['base_offset']
+        stream0_size = desc['stream0_size']
+
+        result = _extract_cgml_ranges(
+            gpu_data, base_offset, stream0_size, vertex_count,
+            index_count, 28, index_offset, index_stride
+        )
+        if result is not None:
+            submeshes.append(result)
+
+    return submeshes
+
+
+def _decode_summer_heuristics(meta, gpu_data):
+    n_meta = len(meta)
+    if n_meta < 16:
+        return []
+
+    def u32(off):
+        if off < 0 or off + 4 > n_meta:
+            return 0
+        return struct.unpack_from("<I", meta, off)[0]
+
+    # 1. Collect submesh index candidates
+    submesh_candidates = []
+    for off in range(0, n_meta - 16, 4):
+        idx_off, idx_count, r_kind, r_extra = struct.unpack_from("<IIII", meta, off)
+        if r_kind in (2, 4) and r_extra == 0 and idx_count >= 3 and idx_off >= 1024 and idx_off % 2 == 0:
+            idx_stride = 2 if r_kind == 2 else 4
+            if idx_off + idx_count * idx_stride <= len(gpu_data):
+                submesh_candidates.append((idx_off, idx_count, idx_stride))
+
+    if not submesh_candidates:
+        return []
+
+    # Keep GPU/index-buffer order. Material mappings follow resource order on
+    # multi-part models; LOD trimming is handled later by the importer.
+    submesh_candidates = sorted(submesh_candidates, key=lambda x: x[0])
+
+    # 2. Collect potential vertex counts
+    vcount_candidates = []
+    for off in range(0, n_meta - 4, 4):
+        val = u32(off)
+        if 10 <= val <= 65535:
+            vcount_candidates.append(val)
+    vcount_candidates = sorted(list(set(vcount_candidates)))
+
+    # 3. Collect potential vertex offsets from metadata values
+    vo_candidates = [0]
+    for off in range(0, n_meta - 4, 4):
+        val = u32(off)
+        if val < len(gpu_data) and val % 4 == 0:
+            vo_candidates.append(val)
+    vo_candidates = sorted(list(set(vo_candidates)))
+
+    # Finest submesh (LOD 0) info
+    idx_off0, idx_count0, idx_stride0 = submesh_candidates[0]
+    idxs0 = struct.unpack_from(f"<{idx_count0}H" if idx_stride0 == 2 else f"<{idx_count0}I", gpu_data, idx_off0)
+    valid_idxs0 = [x for x in idxs0 if x != 65535 and x != 4294967295]
+    if not valid_idxs0:
+        return []
+    min_vc0 = max(valid_idxs0) + 1
+
+    vc0_candidates = [v for v in vcount_candidates if v >= min_vc0]
+    if min_vc0 not in vc0_candidates:
+        vc0_candidates.append(min_vc0)
+    vc0_candidates = sorted(list(set(vc0_candidates)))
+
+    valid_strides = (112, 108, 80, 64, 56, 48, 44, 40, 36, 32, 28, 24, 20, 16, 12)
+
+    def build_faces(idxs):
+        faces = []
+        current_face = []
+        for idx in idxs:
+            if idx == 65535 or idx == 4294967295:
+                current_face = []
+                continue
+            current_face.append(idx)
+            if len(current_face) == 3:
+                faces.append(tuple(current_face))
+                current_face = []
+        return faces
+
+    def extract_uvs(vertex_offset, vertex_stride, vertex_count, pos_off):
+        uv_off = 20 if pos_off == 0 and vertex_stride >= 28 else None
+        if uv_off is None or uv_off + 8 > vertex_stride:
+            return [(0.0, 0.0)] * vertex_count
+
+        uvs = []
+        valid_count = 0
+        for i in range(vertex_count):
+            off = vertex_offset + i * vertex_stride + uv_off
+            u, v = struct.unpack_from("<ff", gpu_data, off)
+            if math.isfinite(u) and math.isfinite(v) and -16.0 <= u <= 16.0 and -16.0 <= v <= 16.0:
+                valid_count += 1
+                uvs.append((u, v))
+            else:
+                uvs.append((0.0, 0.0))
+        if valid_count < max(3, vertex_count // 4):
+            return [(0.0, 0.0)] * vertex_count
+        return uvs
+
+    def score_preceding_layout(idx_off, idx_count, idx_stride, vertex_count, vertex_stride, pos_off):
+        vertex_offset = idx_off - vertex_count * vertex_stride
+        if vertex_offset < 0 or vertex_offset + vertex_count * vertex_stride != idx_off:
+            return None
+
+        idxs = struct.unpack_from(
+            f"<{idx_count}H" if idx_stride == 2 else f"<{idx_count}I",
+            gpu_data, idx_off)
+        valid_idxs = [x for x in idxs if x != 65535 and x != 4294967295]
+        if not valid_idxs or max(valid_idxs) >= vertex_count:
+            return None
+
+        indexed_verts = []
+        for idx in valid_idxs:
+            off = vertex_offset + idx * vertex_stride + pos_off
+            if off + 12 > len(gpu_data):
+                return None
+            x, y, z = struct.unpack_from("<fff", gpu_data, off)
+            if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+                return None
+            if max(abs(x), abs(y), abs(z)) > 10000.0:
+                return None
+            indexed_verts.append((x, y, z))
+
+        spans = [max(v[a] for v in indexed_verts) - min(v[a] for v in indexed_verts)
+                 for a in range(3)]
+        if sum(1 for s in spans if s > 0.01) < 2:
+            return None
+        if max(spans) > 1000.0:
+            return None
+
+        # Prefer conventional XYZ-at-record-start layouts, exact vertex counts,
+        # and wider records when several interpretations are otherwise valid.
+        min_vc = max(valid_idxs) + 1
+        score = (pos_off, abs(vertex_count - min_vc), -vertex_stride)
+        return score
+
+    # Strong layout: each index buffer is immediately preceded by its matching
+    # vertex stream. Some Summer CGInstancedModelResource files mix strides
+    # across LODs, so the older global-stride search can borrow the wrong stream.
+    preceding_layout = []
+    for idx_off, idx_count, idx_stride in submesh_candidates:
+        idxs = struct.unpack_from(
+            f"<{idx_count}H" if idx_stride == 2 else f"<{idx_count}I",
+            gpu_data, idx_off)
+        valid_idxs = [x for x in idxs if x != 65535 and x != 4294967295]
+        if not valid_idxs:
+            preceding_layout = []
+            break
+        min_vc = max(valid_idxs) + 1
+        candidate_vcounts = [v for v in vcount_candidates if min_vc <= v <= min_vc + 512]
+        if min_vc not in candidate_vcounts:
+            candidate_vcounts.append(min_vc)
+
+        best = None
+        for vc in sorted(set(candidate_vcounts)):
+            for vs in valid_strides:
+                if idx_off - vc * vs < 0:
+                    continue
+                for p_off in (0, 4, 8, 12, 16, 20, 24, 28, 32, 40):
+                    if p_off + 12 > vs:
+                        continue
+                    score = score_preceding_layout(idx_off, idx_count, idx_stride, vc, vs, p_off)
+                    if score is None:
+                        continue
+                    candidate = (score, idx_off - vc * vs, vs, vc, p_off,
+                                 idx_off, idx_count, idx_stride)
+                    if best is None or candidate[0] < best[0]:
+                        best = candidate
+        if best is None:
+            preceding_layout = []
+            break
+        _score, vo, vs, vc, p_off, idx_off, idx_count, idx_stride = best
+        preceding_layout.append((vo, vs, vc, p_off, idx_off, idx_count, idx_stride))
+
+    if preceding_layout:
+        submeshes = []
+        for vo, vs, vc, p_off, idx_off, idx_count, idx_stride in preceding_layout:
+            verts = []
+            for i in range(vc):
+                off = vo + i * vs + p_off
+                x, y, z = struct.unpack_from("<fff", gpu_data, off)
+                verts.append((x, y, z))
+            uvs = extract_uvs(vo, vs, vc, p_off)
+
+            sub_idxs = struct.unpack_from(
+                f"<{idx_count}H" if idx_stride == 2 else f"<{idx_count}I",
+                gpu_data, idx_off)
+            submeshes.append((verts, build_faces(sub_idxs), uvs))
+        return submeshes
+
+    found_layout = None
+
+    # Method A: Try to deduce stride using index_offset - vertex_offset formula
+    for vo0 in vo_candidates:
+        for vc0 in vc0_candidates:
+            stride_size = idx_off0 - vo0
+            if stride_size <= 0:
+                continue
+            if stride_size % vc0 == 0:
+                vs = stride_size // vc0
+                if vs in valid_strides:
+                    for p_off in (0, 12, 16, 20, 24, 28, 32, 40):
+                        if p_off + 12 > vs:
+                            continue
+                        all_ok = True
+                        decoded_submeshes = []
+                        for idx_off, idx_count, idx_stride in submesh_candidates:
+                            sub_idxs = struct.unpack_from(f"<{idx_count}H" if idx_stride == 2 else f"<{idx_count}I", gpu_data, idx_off)
+                            sub_valid = [x for x in sub_idxs if x != 65535 and x != 4294967295]
+                            if not sub_valid:
+                                all_ok = False
+                                break
+                            sub_min_vc = max(sub_valid) + 1
+                            
+                            sub_vo = None
+                            sub_vc = None
+                            for vo in vo_candidates:
+                                for vc in vcount_candidates:
+                                    if vc >= sub_min_vc and vo + vc * vs <= len(gpu_data):
+                                        ok = True
+                                        for idx in sub_valid:
+                                            off = vo + idx * vs + p_off
+                                            x, y, z = struct.unpack_from("<fff", gpu_data, off)
+                                            if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+                                                ok = False
+                                                break
+                                            if max(abs(x), abs(y), abs(z)) > 10000.0:
+                                                ok = False
+                                                break
+                                        if ok:
+                                            sub_vo = vo
+                                            sub_vc = vc
+                                            break
+                                if sub_vo is not None:
+                                    break
+                            if sub_vo is None:
+                                all_ok = False
+                                break
+                            decoded_submeshes.append((sub_vo, vs, sub_vc, p_off, idx_off, idx_count, idx_stride))
+                        if all_ok:
+                            found_layout = decoded_submeshes
+                            break
+                if found_layout:
+                    break
+        if found_layout:
+            break
+
+    # Method B: Fallback - Systematic search over all strides (descending) and position offsets
+    if not found_layout:
+        for vs in valid_strides:
+            for p_off in (0, 12, 16, 20, 24, 28, 32, 40):
+                if p_off + 12 > vs:
+                    continue
+                all_ok = True
+                decoded_submeshes = []
+                for idx_off, idx_count, idx_stride in submesh_candidates:
+                    sub_idxs = struct.unpack_from(f"<{idx_count}H" if idx_stride == 2 else f"<{idx_count}I", gpu_data, idx_off)
+                    sub_valid = [x for x in sub_idxs if x != 65535 and x != 4294967295]
+                    if not sub_valid:
+                        all_ok = False
+                        break
+                    sub_min_vc = max(sub_valid) + 1
+                    
+                    sub_vo = None
+                    sub_vc = None
+                    for vo in vo_candidates:
+                        for vc in vcount_candidates:
+                            if vc >= sub_min_vc and vo + vc * vs <= len(gpu_data):
+                                ok = True
+                                for idx in sub_valid:
+                                    off = vo + idx * vs + p_off
+                                    x, y, z = struct.unpack_from("<fff", gpu_data, off)
+                                    if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+                                        ok = False
+                                        break
+                                    if max(abs(x), abs(y), abs(z)) > 10000.0:
+                                        ok = False
+                                        break
+                                if ok:
+                                    sub_vo = vo
+                                    sub_vc = vc
+                                    break
+                        if sub_vo is not None:
+                            break
+                    if sub_vo is None:
+                        all_ok = False
+                        break
+                    decoded_submeshes.append((sub_vo, vs, sub_vc, p_off, idx_off, idx_count, idx_stride))
+                if all_ok:
+                    found_layout = decoded_submeshes
+                    break
+            if found_layout:
+                break
+
+    if not found_layout:
+        return []
+
+    # Reconstruct meshes for return
+    submeshes = []
+    for vo, vs, vc, p_off, idx_off, idx_count, idx_stride in found_layout:
+        # Extract vertices
+        verts = []
+        for i in range(vc):
+            off = vo + i * vs + p_off
+            x, y, z = struct.unpack_from("<fff", gpu_data, off)
+            verts.append((x, y, z))
+        uvs = extract_uvs(vo, vs, vc, p_off)
+
+        sub_idxs = struct.unpack_from(f"<{idx_count}H" if idx_stride == 2 else f"<{idx_count}I", gpu_data, idx_off)
+        submeshes.append((verts, build_faces(sub_idxs), uvs))
+
+    return submeshes
+
 
 
 # ============================================================
@@ -1313,6 +1758,10 @@ def extract_mesh(gpu_filepath, primary_data=None, auto_find_primary=True):
         if result:
             return result, "primary_described"
 
+        result = _extract_metadata_meshes(data, primary_data)
+        if result:
+            return result, "cgml"
+
         crossref = _extract_crossref_ib_cimr_mesh(data, primary_data)
         hero = _extract_hero_cimr_mesh(data, primary_data)
         crossref_tris = sum(len(sub[1]) for sub in crossref)
@@ -1321,11 +1770,6 @@ def extract_mesh(gpu_filepath, primary_data=None, auto_find_primary=True):
             return crossref, "crossref_ib"
         if hero:
             return hero, "hero"
-
-    if primary_data:
-        result = _extract_metadata_meshes(data, primary_data)
-        if result:
-            return result, "cgml"
 
     result = _extract_dual28_prefixed_mesh(data)
     if result:

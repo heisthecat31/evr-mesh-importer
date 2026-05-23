@@ -60,10 +60,13 @@ def is_valid_extracted_dir(path):
     """Verifies if the path actually contains the materials mapping database directory."""
     if not path or not os.path.exists(path):
         return False
-    hex_mapping = os.path.join(path, "c2434c5a99e139ce")
-    dec_mapping = os.path.join(path, hex_to_signed_decimal("c2434c5a99e139ce"))
-    unsigned_mapping = os.path.join(path, str(int("c2434c5a99e139ce", 16)))
-    return os.path.exists(hex_mapping) or os.path.exists(dec_mapping) or os.path.exists(unsigned_mapping)
+    for folder_hex in ("23d48cecc462abe7", "c2434c5a99e139ce"):
+        hex_mapping = os.path.join(path, folder_hex)
+        dec_mapping = os.path.join(path, hex_to_signed_decimal(folder_hex))
+        unsigned_mapping = os.path.join(path, str(int(folder_hex, 16)))
+        if os.path.exists(hex_mapping) or os.path.exists(dec_mapping) or os.path.exists(unsigned_mapping):
+            return True
+    return False
 
 def is_valid_texture_cache(path):
     """Verifies if the path exists and contains cached PNG texture files."""
@@ -151,16 +154,20 @@ def discover_paths():
 # METADATA PARSING
 # ==============================================================================
 def parse_materials_mapping(pcvr_extracted_dir, model_hash):
-    """Parses c2434c5a99e139ce materials mapping file for texture hashes and bindings."""
-    meta_folder_hex = "c2434c5a99e139ce"
+    """Parses Echo material mapping files for texture hashes and bindings."""
+    meta_folder_hexes = (
+        "23d48cecc462abe7",  # Summer build model-texture mappings
+        "c2434c5a99e139ce",  # Live PCVR model-texture mappings
+    )
     
-    meta_vars = get_all_name_variations(meta_folder_hex)
     model_vars = get_all_name_variations(model_hash)
     
     candidates = []
-    for mf in meta_vars:
-        for mv in model_vars:
-            candidates.append(os.path.join(pcvr_extracted_dir, mf, mv))
+    for meta_folder_hex in meta_folder_hexes:
+        meta_vars = get_all_name_variations(meta_folder_hex)
+        for mf in meta_vars:
+            for mv in model_vars:
+                candidates.append(os.path.join(pcvr_extracted_dir, mf, mv))
             
     mapping_path = None
     for c in candidates:
@@ -190,11 +197,34 @@ def parse_materials_mapping(pcvr_extracted_dir, model_hash):
         
     slot_count = struct.unpack_from("<I", data, rem_offset)[0]
     
-    bindings = []
+    raw_bindings = []
     for i in range(slot_count):
         off = rem_offset + 8 + i * 8
-        val_float = struct.unpack_from("<f", data, off)[0]
-        val_int = struct.unpack_from("<i", data, off + 4)[0]
+        raw_bindings.append(data[off:off + 8])
+
+    def score_order(order):
+        score = 0
+        decoded = []
+        for i, raw in enumerate(raw_bindings):
+            if order == "int_float":
+                val_int = struct.unpack_from("<i", raw, 0)[0]
+                val_float = struct.unpack_from("<f", raw, 4)[0]
+            else:
+                val_float = struct.unpack_from("<f", raw, 0)[0]
+                val_int = struct.unpack_from("<i", raw, 4)[0]
+            if 0 <= val_int < tex_count:
+                score += 2
+            if math.isfinite(val_float) and -1000.0 <= val_float <= 1000.0:
+                score += 1
+            decoded.append((val_float, val_int))
+        return score, decoded
+
+    int_float_score, int_float_decoded = score_order("int_float")
+    float_int_score, float_int_decoded = score_order("float_int")
+    decoded_bindings = int_float_decoded if int_float_score >= float_int_score else float_int_decoded
+
+    bindings = []
+    for i, (val_float, val_int) in enumerate(decoded_bindings):
         bindings.append({
             "slot_idx": i,
             "scale": val_float,
@@ -275,13 +305,21 @@ def classify_texture_by_pixels(filepath):
 # MATERIAL CREATION
 # ==============================================================================
 def create_true_evr_material(mat_name, group_bindings, mapping_textures, resolved_textures, classified_textures, scale=1.0):
-    """Creates a material using the exact PBR bindings from game metadata, resolved dynamically by texture classification."""
+    """Creates a material using Echo's binding slot order.
+
+    The binding order is meaningful. Pixel classification is useful as a
+    fallback, but using it as the primary role selector can put a normal/detail
+    map into Base Color. Echo material groups are normally:
+        slot 0 = base color
+        slot 1 = normal
+        slot 2 = packed roughness/material data
+        slot 3 = emissive/detail
+    """
     mat = bpy.data.materials.new(name=mat_name)
     mat.use_nodes = True
     
-    # Set Eevee Transparency and Shadows
-    mat.blend_method = 'HASHED'
-    mat.use_transparent_shadow = True
+    mat.blend_method = 'OPAQUE'
+    mat.use_transparent_shadow = False
     
     nodes = mat.node_tree.nodes
     links = mat.node_tree.links
@@ -291,15 +329,7 @@ def create_true_evr_material(mat_name, group_bindings, mapping_textures, resolve
     bsdf = nodes.new(type='ShaderNodeBsdfPrincipled')
     bsdf.location = (200, 100)
     
-    # Apply transparency and shiny specular highlight from scale parameter
-    if scale <= 1.0:
-        bsdf.inputs['Alpha'].default_value = scale
-        # If this is the visor glass dome (usually Skin_1), configure beautiful shiny glass
-        if "skin_1" in mat_name.lower():
-            bsdf.inputs['Roughness'].default_value = 0.05
-            bsdf.inputs['Metallic'].default_value = 0.1
-    else:
-        bsdf.inputs['Alpha'].default_value = 1.0
+    bsdf.inputs['Alpha'].default_value = 1.0
         
     output = nodes.new(type='ShaderNodeOutputMaterial')
     output.location = (500, 100)
@@ -310,33 +340,28 @@ def create_true_evr_material(mat_name, group_bindings, mapping_textures, resolve
     uv_node.uv_map = "UVMap"
     uv_node.location = (-600, 400)
     
-    # Dynamically classify and resolve texture roles in this slot group
-    p_base = None
-    p_normal = None
-    p_roughness = None
-    p_emissive = None
-
-    is_normal_rg = False
-    for slot_in_group, bind in group_bindings.items():
+    def path_for_slot(slot_in_group):
+        bind = group_bindings.get(slot_in_group)
+        if not bind:
+            return None, None
         tex_idx = bind["texture_idx"]
         if tex_idx < 0 or tex_idx >= len(mapping_textures):
-            continue
+            return None, None
         tex_hash = mapping_textures[tex_idx]
-        tex_path = resolved_textures.get(tex_hash)
-        if not tex_path:
-            continue
-            
-        role = classified_textures.get(tex_hash, "albedo")
-        if role == "albedo":
-            p_base = tex_path
-        elif role in ("normal", "normal_rg"):
-            p_normal = tex_path
-            if role == "normal_rg":
-                is_normal_rg = True
-        elif role in ("roughness", "metallic"):
-            p_roughness = tex_path
-        elif role == "emissive":
-            p_emissive = tex_path
+        return resolved_textures.get(tex_hash), classified_textures.get(tex_hash, "albedo")
+
+    p_base, _base_role = path_for_slot(0)
+    p_normal, normal_role = path_for_slot(1)
+    p_roughness, _roughness_role = path_for_slot(2)
+    p_emissive, _emissive_role = path_for_slot(3)
+    is_normal_rg = normal_role == "normal_rg"
+    print(
+        f"[EVR Material] {mat_name}: "
+        f"base={os.path.basename(p_base) if p_base else 'None'}, "
+        f"normal={os.path.basename(p_normal) if p_normal else 'None'}, "
+        f"packed={os.path.basename(p_roughness) if p_roughness else 'None'}, "
+        f"emissive={os.path.basename(p_emissive) if p_emissive else 'None'}"
+    )
 
     # 1. Base Color
     node_albedo = None
@@ -478,10 +503,190 @@ def create_true_evr_material(mat_name, group_bindings, mapping_textures, resolve
         
     return mat
 
+
+def create_ordered_evr_material(mat_name, texture_hashes, resolved_textures):
+    """Create a material from sequential Echo texture order.
+
+    This mirrors the known-good Doug script: each skin group is the next four
+    texture hashes in order, where index 0 is the visible atlas/base color.
+    """
+    mat = bpy.data.materials.new(name=mat_name)
+    mat.use_nodes = True
+    mat.blend_method = 'OPAQUE'
+    mat.use_transparent_shadow = False
+
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    nodes.clear()
+
+    bsdf = nodes.new(type='ShaderNodeBsdfPrincipled')
+    bsdf.location = (200, 100)
+    bsdf.inputs['Alpha'].default_value = 1.0
+    if 'Roughness' in bsdf.inputs:
+        bsdf.inputs['Roughness'].default_value = 0.5
+
+    output = nodes.new(type='ShaderNodeOutputMaterial')
+    output.location = (500, 100)
+    links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])
+
+    uv_node = nodes.new(type='ShaderNodeUVMap')
+    uv_node.uv_map = "UVMap"
+    uv_node.location = (-600, 300)
+
+    def image_for(slot, colorspace):
+        if slot >= len(texture_hashes):
+            return None, None
+        tex_hash = texture_hashes[slot]
+        tex_path = resolved_textures.get(tex_hash)
+        if not tex_path:
+            return tex_hash, None
+        image = bpy.data.images.load(tex_path)
+        image.colorspace_settings.name = colorspace
+        return tex_hash, image
+
+    base_hash, base_image = image_for(0, 'sRGB')
+    normal_hash, normal_image = image_for(1, 'Non-Color')
+    packed_hash, packed_image = image_for(2, 'Non-Color')
+    emit_hash, emit_image = image_for(3, 'sRGB')
+    print(
+        f"[EVR Material] {mat_name}: "
+        f"base={base_hash or 'None'}, normal={normal_hash or 'None'}, "
+        f"packed={packed_hash or 'None'}, emissive={emit_hash or 'None'}"
+    )
+
+    if base_image:
+        node = nodes.new(type='ShaderNodeTexImage')
+        node.location = (-300, 300)
+        node.image = base_image
+        node.interpolation = 'Cubic'
+        links.new(uv_node.outputs['UV'], node.inputs['Vector'])
+        links.new(node.outputs['Color'], bsdf.inputs['Base Color'])
+
+    if normal_image:
+        node = nodes.new(type='ShaderNodeTexImage')
+        node.location = (-300, 20)
+        node.image = normal_image
+        node.interpolation = 'Cubic'
+        normal_map = nodes.new(type='ShaderNodeNormalMap')
+        normal_map.location = (-40, 20)
+        normal_map.inputs['Strength'].default_value = 1.0
+        links.new(uv_node.outputs['UV'], node.inputs['Vector'])
+        links.new(node.outputs['Color'], normal_map.inputs['Color'])
+        links.new(normal_map.outputs['Normal'], bsdf.inputs['Normal'])
+
+    if packed_image:
+        node = nodes.new(type='ShaderNodeTexImage')
+        node.location = (-300, -240)
+        node.image = packed_image
+        node.interpolation = 'Cubic'
+        separate = nodes.new(type='ShaderNodeSeparateColor')
+        separate.location = (-40, -240)
+        links.new(uv_node.outputs['UV'], node.inputs['Vector'])
+        links.new(node.outputs['Color'], separate.inputs['Color'])
+        if 'Metallic' in bsdf.inputs:
+            links.new(separate.outputs['Red'], bsdf.inputs['Metallic'])
+        if 'Roughness' in bsdf.inputs:
+            links.new(separate.outputs['Green'], bsdf.inputs['Roughness'])
+
+    if emit_image:
+        node = nodes.new(type='ShaderNodeTexImage')
+        node.location = (-300, -500)
+        node.image = emit_image
+        node.interpolation = 'Cubic'
+        links.new(uv_node.outputs['UV'], node.inputs['Vector'])
+        if 'Emission Color' in bsdf.inputs:
+            links.new(node.outputs['Color'], bsdf.inputs['Emission Color'])
+        if 'Emission Strength' in bsdf.inputs:
+            bsdf.inputs['Emission Strength'].default_value = 0.25
+
+    return mat
+
 # ==============================================================================
 # MAIN APPLYING INTERFACE
 # ==============================================================================
-def apply_textures_to_objects(model_hash, pcvr_extracted_dir, texture_cache_dir, target_objects):
+def _objects_look_like_lod_stack(objects):
+    mesh_objects = [obj for obj in objects if getattr(obj, "type", None) == 'MESH' and obj.data and obj.data.vertices]
+    if len(mesh_objects) < 2:
+        return False
+
+    def bbox(obj):
+        coords = [obj.matrix_world @ v.co for v in obj.data.vertices]
+        mins = [min(co[i] for co in coords) for i in range(3)]
+        maxs = [max(co[i] for co in coords) for i in range(3)]
+        center = [(mins[i] + maxs[i]) * 0.5 for i in range(3)]
+        size = [maxs[i] - mins[i] for i in range(3)]
+        diag = max(math.sqrt(sum(s * s for s in size)), 1e-6)
+        return center, diag
+
+    c0, d0 = bbox(mesh_objects[0])
+    similar = 0
+    for obj in mesh_objects[1:]:
+        c, d = bbox(obj)
+        center_delta = math.sqrt(sum((c[i] - c0[i]) ** 2 for i in range(3)))
+        if center_delta <= d0 * 0.25 and 0.35 <= d / d0 <= 1.65:
+            similar += 1
+    return similar >= max(1, len(mesh_objects) - 2)
+
+
+import random
+
+def _score_texture_uv_match(img, uv_samples):
+    if not img or not img.pixels:
+        return -1.0
+        
+    width = img.size[0]
+    height = img.size[1]
+    if width == 0 or height == 0:
+        return -1.0
+        
+    if len(uv_samples) > 200:
+        uv_samples = random.sample(uv_samples, 200)
+        
+    hits = 0
+    total = len(uv_samples)
+    
+    # 1. Calculate Hit Rate (under UVs)
+    for u, v in uv_samples:
+        u_frac = u % 1.0
+        v_frac = v % 1.0
+        px = int(u_frac * width)
+        py = int(v_frac * height)
+        px = max(0, min(px, width - 1))
+        py = max(0, min(py, height - 1))
+        
+        idx = (py * width + px) * 4 + 3
+        # Check if pixel has alpha > 0.05 AND color > 0.05
+        a = img.pixels[idx]
+        r = img.pixels[idx - 3]
+        g = img.pixels[idx - 2]
+        b = img.pixels[idx - 1]
+        if a > 0.05 and (r > 0.05 or g > 0.05 or b > 0.05):
+            hits += 1
+            
+    hit_rate = hits / total if total > 0 else 0.0
+    
+    # 2. Calculate Background Opacity (random sampling)
+    # A true match should have high hit_rate but low background opacity
+    # A solid white texture will have 1.0 hit_rate AND 1.0 bg_rate -> score 0.0
+    bg_hits = 0
+    bg_samples = 200
+    for _ in range(bg_samples):
+        px = random.randint(0, width - 1)
+        py = random.randint(0, height - 1)
+        idx = (py * width + px) * 4 + 3
+        a = img.pixels[idx]
+        r = img.pixels[idx - 3]
+        g = img.pixels[idx - 2]
+        b = img.pixels[idx - 1]
+        if a > 0.05 and (r > 0.05 or g > 0.05 or b > 0.05):
+            bg_hits += 1
+            
+    bg_rate = bg_hits / bg_samples
+    
+    return hit_rate - bg_rate
+
+def apply_textures_to_objects(model_hash, pcvr_extracted_dir, texture_cache_dir, target_objects,
+                              texture_group_mode="sequential", material_assign_mode="auto"):
     """Parses textures for model_hash and procedurally applies PBR node materials onto target_objects."""
     # 1. Standardize and discover missing paths
     disc = discover_paths()
@@ -507,9 +712,8 @@ def apply_textures_to_objects(model_hash, pcvr_extracted_dir, texture_cache_dir,
     if not mapping:
         return 0
         
-    # 3. Classify and Resolve Unique Textures on Disk
+    # 3. Resolve Unique Textures on Disk
     resolved_textures = {}
-    classified_textures = {}
     
     for tex_hash in set(mapping["textures"]):
         vars = get_all_name_variations(tex_hash)
@@ -517,43 +721,45 @@ def apply_textures_to_objects(model_hash, pcvr_extracted_dir, texture_cache_dir,
         for v in vars:
             png_path = os.path.join(t_cache, f"{v}.png")
             if os.path.exists(png_path):
-                if os.path.getsize(png_path) >= 500:
-                    found_path = png_path
-                    break
+                found_path = png_path
+                break
         if found_path:
             resolved_textures[tex_hash] = found_path
-            tex_type = classify_texture_by_pixels(found_path)
-            classified_textures[tex_hash] = tex_type
             
     if not resolved_textures:
         print("[-] Texture Auto-Apply: No texture cached PNG files resolved.")
         return 0
         
-    # 4. Group bindings
-    groups = {}
-    for bind in mapping["bindings"]:
-        g_idx = bind["slot_idx"] // 4
-        slot_in_group = bind["slot_idx"] % 4
-        if g_idx not in groups:
-            groups[g_idx] = {}
-        groups[g_idx][slot_in_group] = bind
+    # 4. Group texture hashes. Sequential matches the verified Doug workflow;
+    # binding mode is available for resources whose second table is authoritative.
+    if texture_group_mode == "binding":
+        grouped = {}
+        for bind in mapping["bindings"]:
+            tex_idx = bind["texture_idx"]
+            if 0 <= tex_idx < len(mapping["textures"]):
+                g_idx = bind["slot_idx"] // 4
+                slot = bind["slot_idx"] % 4
+                grouped.setdefault(g_idx, {})[slot] = mapping["textures"][tex_idx]
+        texture_groups = [
+            [slots[slot] for slot in sorted(slots.keys())]
+            for _g_idx, slots in sorted(grouped.items())
+        ]
+    else:
+        texture_groups = [
+            mapping["textures"][i:i + 4]
+            for i in range(0, len(mapping["textures"]), 4)
+        ]
         
     # 5. Create PBR Materials
     created_materials = []
-    for g_idx in sorted(groups.keys()):
+    for g_idx, texture_group in enumerate(texture_groups):
         mat_name = f"{model_hash}_Skin_{g_idx}"
         # Reuse existing material if present to avoid duplicating nodes
         mat = bpy.data.materials.get(mat_name)
         if mat:
             bpy.data.materials.remove(mat)
-            
-        # Retrieve scale factor from bindings in this group to drive material transparency
-        group_scale = 1.0
-        for slot, bind in groups[g_idx].items():
-            group_scale = bind.get("scale", 1.0)
-            break
-            
-        mat = create_true_evr_material(mat_name, groups[g_idx], mapping["textures"], resolved_textures, classified_textures, scale=group_scale)
+
+        mat = create_ordered_evr_material(mat_name, texture_group, resolved_textures)
         created_materials.append(mat)
         
     if not created_materials:
@@ -562,35 +768,97 @@ def apply_textures_to_objects(model_hash, pcvr_extracted_dir, texture_cache_dir,
     # 6. Assign constructed materials
     # Clear existing slots on each mesh object and add all created materials to its slots.
     # Assign each face's material index using the game engine's cumulative vertex face ranges.
+    lod_stack = _objects_look_like_lod_stack(target_objects) or len(target_objects) == 1
     for idx, obj in enumerate(target_objects):
         obj.data.materials.clear()
         for mat in created_materials:
             obj.data.materials.append(mat)
             
-        # Get logical material index stored on the object, fallback to its list index
-        mat_idx = obj.get("evr_material_index", idx)
-        if mat_idx >= len(created_materials):
-            mat_idx = 0
+        if material_assign_mode == "uv_scanner":
+            uv_layer = obj.data.uv_layers.active
+            if not uv_layer:
+                continue
+                
+            # Group polygons by UV tile
+            tile_to_polys = {}
+            tile_to_uvs = {}
+            
+            for poly in obj.data.polygons:
+                # Use the first vertex of the polygon to determine its UV tile
+                u, v = uv_layer.data[poly.loop_indices[0]].uv
+                tile = (math.floor(u), math.floor(v))
+                
+                if tile not in tile_to_polys:
+                    tile_to_polys[tile] = []
+                    tile_to_uvs[tile] = []
+                    
+                tile_to_polys[tile].append(poly.index)
+                
+                for loop_idx in poly.loop_indices:
+                    tile_to_uvs[tile].append(uv_layer.data[loop_idx].uv[:])
+                    
+            for tile, polys in tile_to_polys.items():
+                best_mat_idx = 0
+                best_score = -1.0
+                
+                for m_idx, mat in enumerate(created_materials):
+                    score = 0.0
+                    nodes = mat.node_tree.nodes
+                    tex_node = None
+                    for node in nodes:
+                        if node.type == 'TEX_IMAGE':
+                            for out in node.outputs:
+                                if out.is_linked:
+                                    for link in out.links:
+                                        if link.to_socket.name == 'Base Color':
+                                            tex_node = node
+                                            break
+                                if tex_node: break
+                        if tex_node: break
+                            
+                    if tex_node and tex_node.image:
+                        score = _score_texture_uv_match(tex_node.image, tile_to_uvs[tile])
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_mat_idx = m_idx
+                        
+                for p_idx in polys:
+                    obj.data.polygons[p_idx].material_index = best_mat_idx
 
-        v_count = len(obj.data.vertices)
-        if len(created_materials) >= 5 and v_count < 200:
-            # Map face materials using exact cumulative vertex index ranges specifically for the Visor hack
-            for poly in obj.data.polygons:
-                v_max = max(poly.vertices)
-                if v_max <= 4:
-                    poly.material_index = 1
-                elif v_max <= 6:
-                    poly.material_index = 2
-                elif v_max <= 12:
-                    poly.material_index = 3
-                elif v_max <= 19:
-                    poly.material_index = 4
-                else:
-                    poly.material_index = 0
+        elif material_assign_mode == "first":
+            mat_idx = 0
+        elif material_assign_mode == "submesh":
+            mat_idx = obj.get("evr_material_index", idx)
+        elif material_assign_mode == "reverse":
+            mat_idx = len(target_objects) - 1 - idx
         else:
-            # Assign the proper logical material index corresponding to this submesh
-            for poly in obj.data.polygons:
-                poly.material_index = mat_idx
+            # Auto: a single imported mesh is usually LOD0 after the importer
+            # trims LOD stacks, so use Skin 0. True multi-part models use order.
+            mat_idx = 0 if lod_stack else obj.get("evr_material_index", idx)
+            
+            if mat_idx >= len(created_materials):
+                mat_idx = 0
+
+            v_count = len(obj.data.vertices)
+            if len(created_materials) >= 5 and v_count < 200:
+                # Map face materials using exact cumulative vertex index ranges specifically for the Visor hack
+                for poly in obj.data.polygons:
+                    v_max = max(poly.vertices)
+                    if v_max <= 4:
+                        poly.material_index = 1
+                    elif v_max <= 6:
+                        poly.material_index = 2
+                    elif v_max <= 12:
+                        poly.material_index = 3
+                    elif v_max <= 19:
+                        poly.material_index = 4
+                    else:
+                        poly.material_index = 0
+            else:
+                # Assign the proper logical material index corresponding to this submesh
+                for poly in obj.data.polygons:
+                    poly.material_index = mat_idx
             
     # Switch all 3D viewports to Material Preview shading mode so textures are instantly visible
     for screen in bpy.data.screens:
