@@ -44,3 +44,7 @@ test3.py
 load_model_with_textures.py
 test.py
 test3.py
+cgml_dump.json
+bugfix.patch
+_debug_obj_roundtrip.py
+encode_diff.txt
