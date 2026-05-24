@@ -7,7 +7,7 @@ https://github.com/Dualgame/evr-mesh-importer
 bl_info = {
     "name": "EVR Raw Mesh Importer",
     "author": "Dualgame",
-    "version": (1, 4, 0),
+    "version": (1, 2, 5),
     "blender": (3, 0, 0),
     "location": "File > Import/Export > EVR Raw Mesh",
     "description": "Import/export raw GPU mesh binaries from Echo VR (Echo Arena)",
@@ -39,6 +39,8 @@ from .encode import (
     encode_heuristic_dual28,
     encode_cgml,
     mesh_from_blender_object,
+    EncodeSizeError,
+    VertexLimitError,
 )
 from .textures import apply_textures_to_objects
 
@@ -253,6 +255,12 @@ class EVR_ExportSettings(bpy.types.PropertyGroup):
     )
     compute_normals: BoolProperty(name="Compute Normals", default=True)
     write_primary: BoolProperty(name="Write Primary File", default=True)
+    auto_decimate: BoolProperty(
+        name="Auto Decimate",
+        description="Automatically decimate mesh if it exceeds vertex or file size limits",
+        default=True,
+    )
+
     stream0_stride: EnumProperty(name="Stream-0 Stride", items=[('auto', "Auto-Detect", ""), ('16', "16 bytes", ""), ('20', "20 bytes", "")], default='auto')
     scale: FloatProperty(name="Scale", default=1.0)
 
@@ -347,6 +355,8 @@ class EVR_PT_ExportPanel(bpy.types.Panel):
             layout.prop(settings, "write_primary")
             layout.prop(settings, "stream0_stride")
         layout.prop(settings, "compute_normals")
+        layout.prop(settings, "auto_decimate")
+
         layout.prop(settings, "scale")
         layout.separator()
         layout.label(text="Utilities:")
@@ -408,66 +418,57 @@ class EVR_OT_ExportMesh(Operator):
         out_gpu_path = os.path.join(out_gpu_dir, hash_name)
         out_pri_path = os.path.join(out_pri_dir, hash_name)
 
-        if settings.encode_mode == 'cgml' or (settings.encode_mode == 'primary_described' and is_cgml):
-            export_objs = self._get_all_submeshes(context, is_cgml, obj)
-            submeshes = []
-            do_split = (len(export_objs) == 1)
-            for eo in export_objs:
-                if do_split:
-                    submeshes.extend(mesh_from_blender_object(eo, apply_transforms=True, split_by_material=True))
+        ratio = 1.0
+        max_attempts = 10
+
+        for attempt in range(max_attempts):
+            try:
+                if settings.encode_mode == 'cgml' or (settings.encode_mode == 'primary_described' and is_cgml):
+                    export_objs = self._get_all_submeshes(context, is_cgml, obj)
+                    submeshes = []
+                    do_split = (len(export_objs) == 1)
+                    for eo in export_objs:
+                        if do_split:
+                            submeshes.extend(mesh_from_blender_object(eo, apply_transforms=True, split_by_material=True, decimate_ratio=ratio))
+                        else:
+                            submeshes.append(mesh_from_blender_object(eo, apply_transforms=True, split_by_material=False, decimate_ratio=ratio))
                 else:
-                    submeshes.append(mesh_from_blender_object(eo, apply_transforms=True, split_by_material=False))
-        else:
-            res = mesh_from_blender_object(obj, apply_transforms=True, split_by_material=False)
-            verts, faces, uvs = res[0], res[1], res[2]
-            bone_data = res[3] if len(res) > 3 else None
+                    res = mesh_from_blender_object(obj, apply_transforms=True, split_by_material=False, decimate_ratio=ratio)
+                    verts, faces, uvs = res[0], res[1], res[2]
+                    bone_data = res[3] if len(res) > 3 else None
 
-        if settings.scale != 1.0:
-            s = settings.scale
-            if settings.encode_mode == 'cgml': submeshes = [([(x*s, y*s, z*s) for x,y,z in sub[0]], *sub[1:]) for sub in submeshes]
-            else: verts = [(x*s, y*s, z*s) for x,y,z in verts]
+                if settings.scale != 1.0:
+                    s = settings.scale
+                    if settings.encode_mode == 'cgml' or (settings.encode_mode == 'primary_described' and is_cgml):
+                        submeshes = [([(x*s, y*s, z*s) for x,y,z in sub[0]], *sub[1:]) for sub in submeshes]
+                    else: 
+                        verts = [(x*s, y*s, z*s) for x,y,z in verts]
 
-        try:
-            cn = settings.compute_normals
-            os.makedirs(out_gpu_dir, exist_ok=True)
+                cn = settings.compute_normals
+                os.makedirs(out_gpu_dir, exist_ok=True)
 
-            if settings.encode_mode == 'heuristic_s16':
-                self._write_gpu(out_gpu_path, encode_heuristic_s16(verts, faces, uvs=uvs, bone_data=bone_data, compute_normals=cn))
-                self.report({'INFO'}, f"Saved GPU to {out_gpu_path}")
-            elif settings.encode_mode == 'heuristic_s20':
-                self._write_gpu(out_gpu_path, encode_heuristic_s20(verts, faces, uvs=uvs, bone_data=bone_data, compute_normals=cn))
-                self.report({'INFO'}, f"Saved GPU to {out_gpu_path}")
-            elif settings.encode_mode == 'heuristic_dual28':
-                self._write_gpu(out_gpu_path, encode_heuristic_dual28(verts, faces, bone_data=bone_data, compute_normals=cn))
-                self.report({'INFO'}, f"Saved GPU to {out_gpu_path}")
-            elif settings.encode_mode == 'cgml':
-                self._write_gpu(out_gpu_path, encode_cgml(submeshes, compute_normals=cn))
-                self.report({'INFO'}, f"Saved GPU to {out_gpu_path}")
-            elif settings.encode_mode == 'primary_described':
-                s0_stride = None if settings.stream0_stride == 'auto' else int(settings.stream0_stride)
-                from .primary import _find_primary_path
-                orig_primary_path = _find_primary_path(orig_gpu_path)
-                
-                if orig_primary_path and os.path.exists(orig_primary_path):
-                    with open(orig_gpu_path, 'rb') as f: orig_gpu = f.read()
-                    with open(orig_primary_path, 'rb') as f: orig_primary = f.read()
+                if settings.encode_mode == 'heuristic_s16':
+                    self._write_gpu(out_gpu_path, encode_heuristic_s16(verts, faces, uvs=uvs, bone_data=bone_data, compute_normals=cn))
+                    self.report({'INFO'}, f"Saved GPU to {out_gpu_path}")
+                elif settings.encode_mode == 'heuristic_s20':
+                    self._write_gpu(out_gpu_path, encode_heuristic_s20(verts, faces, uvs=uvs, bone_data=bone_data, compute_normals=cn))
+                    self.report({'INFO'}, f"Saved GPU to {out_gpu_path}")
+                elif settings.encode_mode == 'heuristic_dual28':
+                    self._write_gpu(out_gpu_path, encode_heuristic_dual28(verts, faces, bone_data=bone_data, compute_normals=cn))
+                    self.report({'INFO'}, f"Saved GPU to {out_gpu_path}")
+                elif settings.encode_mode == 'cgml':
+                    self._write_gpu(out_gpu_path, encode_cgml(submeshes, compute_normals=cn))
+                    self.report({'INFO'}, f"Saved GPU to {out_gpu_path}")
+                elif settings.encode_mode == 'primary_described':
+                    s0_stride = None if settings.stream0_stride == 'auto' else int(settings.stream0_stride)
+                    from .primary import _find_primary_path
+                    orig_primary_path = _find_primary_path(orig_gpu_path)
                     
-                    try:
+                    if orig_primary_path and os.path.exists(orig_primary_path):
+                        with open(orig_gpu_path, 'rb') as f: orig_gpu = f.read()
+                        with open(orig_primary_path, 'rb') as f: orig_primary = f.read()
+                        
                         if is_cgml:
-                            # Re-extract submeshes for CGML if we haven't already
-                            export_objs = self._get_all_submeshes(context, is_cgml, obj)
-                            submeshes = []
-                            do_split = (len(export_objs) == 1)
-                            for eo in export_objs:
-                                if do_split:
-                                    submeshes.extend(mesh_from_blender_object(eo, apply_transforms=True, split_by_material=True))
-                                else:
-                                    submeshes.append(mesh_from_blender_object(eo, apply_transforms=True, split_by_material=False))
-                                
-                            if settings.scale != 1.0:
-                                s = settings.scale
-                                submeshes = [([(x*s, y*s, z*s) for x,y,z in sub[0]], *sub[1:]) for sub in submeshes]
-
                             from .encode import encode_cgml_primary_replace
                             gpu_data, primary_data = encode_cgml_primary_replace(
                                 orig_gpu, orig_primary, submeshes, stream0_stride=s0_stride, compute_normals=cn
@@ -485,16 +486,29 @@ class EVR_OT_ExportMesh(Operator):
                             self.report({'INFO'}, f"Saved GPU to {out_gpu_path} and Primary to {out_pri_path}")
                         else:
                             self.report({'INFO'}, f"Saved GPU to {out_gpu_path}")
-                    except ValueError as e:
-                        self.report({'ERROR'}, str(e))
+                    else:
+                        self.report({'ERROR'}, f"Could not find original Primary file for {orig_gpu_path}")
                         return {'CANCELLED'}
+                        
+                break # Successfully saved, exit retry loop
+
+            except VertexLimitError as e:
+                if settings.auto_decimate and attempt < max_attempts - 1:
+                    target_ratio = (e.max_verts / e.current_verts) * 0.85
+                    ratio = max(ratio * target_ratio, 0.01)
+                    self.report({'INFO'}, f"Vertex limit exceeded ({e.current_verts} > {e.max_verts}). Auto-decimating (Ratio: {ratio:.3f})")
+                    continue
                 else:
-                    self.report({'ERROR'}, f"Could not find original Primary file for {orig_gpu_path}")
+                    self.report({'ERROR'}, str(e))
                     return {'CANCELLED'}
 
-        except Exception as e:
-            self.report({'ERROR'}, f"Encode failed: {e}")
-            return {'CANCELLED'}
+            except ValueError as e:
+                self.report({'ERROR'}, str(e))
+                return {'CANCELLED'}
+            except Exception as e:
+                self.report({'ERROR'}, f"Encode failed: {e}")
+                return {'CANCELLED'}
+
         return {'FINISHED'}
 
     def _write_gpu(self, path, data):

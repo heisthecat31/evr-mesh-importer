@@ -35,6 +35,16 @@ Go to **File > Import > EVR Raw Mesh**, navigate to a GPU binary (e.g. inside `G
 
 In the file browser, select multiple files (Shift-click or Ctrl-click) before clicking Import. Each file is imported as its own root object. All imported roots are selected when the dialog closes, with the last one set as the active object.
 
+### Exporting custom meshes (Bypassing File Size Limits)
+
+Go to **File > Export > EVR Raw Mesh** and select the original GPU file you want to overwrite. For the most reliable export (especially for props and chassis models), ensure the **Encode Mode** is set to **Primary Described (Full Replace)** and point it to the matching original Primary metadata file.
+
+**Massive Breakthrough:** The exporter now fully reverse-engineers and patches the `0x0B` rendering descriptors, Stream Records, and Index Records inside the Primary file. This explicitly tells the RAD Engine to dynamically allocate new memory for your custom mesh. **You are no longer constrained by the original GPU file's size!** You can safely overwrite a 180 KB original file with a 1 MB+ high-poly custom mesh, and it will load flawlessly in-game (up to the engine's hard limit of 65,535 vertices per submesh).
+
+#### Preventing "Bone LOD Culling" (Mesh Vanishing)
+If you are overwriting a "Chassis" model (which contains a complex skeleton), the engine will automatically disable "detail" bones (like antennas or small fins) at a distance to save performance. If your custom mesh is weighted to one of these detail bones, parts of it will vanish when you move far away.
+**To fix this:** In Blender, delete all Vertex Groups on your custom mesh, create a single new vertex group named exactly **`Bone.000`** (or your absolute root bone), and assign all vertices to it with a weight of `1.0`. The root bone is never culled, ensuring your model stays visible at any distance.
+
 ### Primary file auto-discovery
 
 For the best decode quality, the importer needs a matching Primary binary alongside the GPU binary. If **Auto-find Primary** is enabled (the default), the importer looks for the Primary file automatically using the standard extracted directory layout:

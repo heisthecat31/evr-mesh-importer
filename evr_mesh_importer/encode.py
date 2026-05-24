@@ -8,8 +8,26 @@ import math
 
 
 # ============================================================
-# Math helpers
+# Math & Validation helpers
 # ============================================================
+
+class EncodeSizeError(ValueError):
+    def __init__(self, new_size, orig_size):
+        self.new_size = new_size
+        self.orig_size = orig_size
+        super().__init__(f"Encode failed: The new mesh is too large! It resulted in a {new_size} byte file, but the original file was only {orig_size} bytes.")
+
+class VertexLimitError(ValueError):
+    def __init__(self, current_verts, max_verts=65535, mesh_name="Mesh"):
+        self.current_verts = current_verts
+        self.max_verts = max_verts
+        super().__init__(f"Mesh '{mesh_name}' has {current_verts} vertices. Decimate below {max_verts} before exporting.")
+
+def _validate_mesh(verts, faces, name="Mesh", allow_degenerate=False):
+    if len(verts) > 65535:
+        raise ValueError(f"Encode failed ({name}): Vertex count {len(verts)} exceeds the 65535 maximum limit for 16-bit indices.")
+    if len(verts) == 0 and not allow_degenerate:
+        raise ValueError(f"Encode failed ({name}): Mesh has 0 vertices.")
 
 def _normalize(v):
     x, y, z = v
@@ -345,7 +363,7 @@ def encode_primary_described(verts, faces, uvs=None, bone_data=None, stream0_str
 
     return gpu_data, primary_data
 
-def encode_cgml(submesh_list, compute_normals=True):
+def encode_cgml(submesh_list, compute_normals=True, enforce_size_limit=True):
     out = bytearray()
     for i, sub in enumerate(submesh_list):
         if len(sub) == 3:
@@ -361,11 +379,41 @@ def encode_cgml(submesh_list, compute_normals=True):
 # Blender mesh extraction
 # ============================================================
 
-def mesh_from_blender_object(obj, apply_transforms=True, split_by_material=False):
+def mesh_from_blender_object(obj, apply_transforms=True, split_by_material=False, decimate_ratio=1.0):
+    import bpy
     import bmesh
 
+    eval_obj = obj
+    mod_name = "EVR_AutoDecimate"
+    weld_name = "EVR_AutoWeld"
+    eval_mesh = None
+    if decimate_ratio < 1.0:
+        weld = obj.modifiers.new(name=weld_name, type='WELD')
+        weld.merge_threshold = 0.001
+        
+        mod = obj.modifiers.new(name=mod_name, type='DECIMATE')
+        mod.decimate_type = 'COLLAPSE'
+        mod.ratio = decimate_ratio
+        
+        # Evaluate to get the decimated mesh geometry
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        eval_obj = obj.evaluated_get(depsgraph)
+        eval_mesh = eval_obj.to_mesh()
+
     bm = bmesh.new()
-    bm.from_mesh(obj.data)
+    if eval_mesh:
+        bm.from_mesh(eval_mesh)
+    else:
+        bm.from_mesh(eval_obj.data)
+
+    # Clean up the modifiers from original object
+    if decimate_ratio < 1.0:
+        if mod_name in obj.modifiers:
+            obj.modifiers.remove(obj.modifiers[mod_name])
+        if weld_name in obj.modifiers:
+            obj.modifiers.remove(obj.modifiers[weld_name])
+        if eval_mesh:
+            eval_obj.to_mesh_clear()
 
     if apply_transforms:
         bm.transform(obj.matrix_world)
@@ -442,10 +490,7 @@ def mesh_from_blender_object(obj, apply_transforms=True, split_by_material=False
 
         bm.free()
         if len(verts) > 65535:
-            raise ValueError(
-                f"Mesh '{obj.name}' has {len(verts)} vertices. "
-                "Decimate below 65536 before exporting."
-            )
+            raise VertexLimitError(len(verts), mesh_name=obj.name)
         return verts, faces, uvs, bone_data
 
     attr_layer = bm.faces.layers.int.get("cgml_submesh")
@@ -478,11 +523,11 @@ def mesh_from_blender_object(obj, apply_transforms=True, split_by_material=False
         tri = []
         for loop in face.loops:
             v = loop.vert
-            key = v.index
+            uv = (loop[uv_layer].uv.x, loop[uv_layer].uv.y) if uv_layer else (0.0, 0.0)
+            key = (round(v.co.x, 4), round(v.co.y, 4), round(v.co.z, 4), round(uv[0], 4), round(uv[1], 4))
             if key not in vm:
                 vm[key] = len(vl)
                 vl.append((v.co.x, v.co.y, v.co.z))
-                uv = (loop[uv_layer].uv.x, loop[uv_layer].uv.y) if uv_layer else (0.0, 0.0)
                 ul.append(uv)
                 bl.append(extract_bone_data(v.index))
             tri.append(vm[key])
@@ -494,12 +539,10 @@ def mesh_from_blender_object(obj, apply_transforms=True, split_by_material=False
     for i in range(n_mats):
         if vert_lists[i] and face_lists[i]:
             if len(vert_lists[i]) > 65535:
-                raise ValueError(
-                    f"Material slot {i} of '{obj.name}' has "
-                    f"{len(vert_lists[i])} vertices. Decimate below 65536."
-                )
+                raise VertexLimitError(len(vert_lists[i]), mesh_name=f"Material slot {i} of '{obj.name}'")
             result.append((vert_lists[i], face_lists[i], uv_lists[i], bone_lists[i]))
     return result
+
 
 def encode_primary_described_full_replace(
         original_gpu_bytes,
@@ -509,7 +552,8 @@ def encode_primary_described_full_replace(
         uvs=None,
         bone_data=None,
         stream0_stride=None,
-        compute_normals=True):
+        compute_normals=True,
+        enforce_size_limit=True):
     import struct
 
     _validate_mesh(verts, faces, "primary_described_full_replace")
@@ -517,6 +561,8 @@ def encode_primary_described_full_replace(
     if len(original_primary_bytes) < 64:
         raise ValueError("Original Primary is too small.")
 
+    orig_gpu_size = len(original_gpu_bytes)
+    
     max_orig_vc = 0
     orig_s0_sz = 0
     detected_stride = None
@@ -540,31 +586,6 @@ def encode_primary_described_full_replace(
 
     real_nv = len(verts)
 
-    # PERFECT PRESERVATION MODE:
-    # If the user did not change the vertex count, we perfectly preserve the ENTIRE FILE
-    # and ONLY overwrite XYZ and UV data. This guarantees 0% chance of corrupting
-    # bone weights, LODs, or topologies (even if Blender scrambled the vertices, we just 
-    # write to the buffers blindly, so at worst the geometry stretches but no data is lost).
-    if real_nv == max_orig_vc and orig_s0_sz > 0 and orig_s0_sz <= len(original_gpu_bytes):
-        patched_gpu = bytearray(original_gpu_bytes)
-        
-        # 1. Overwrite UVs in Stream 0
-        for i in range(real_nv):
-            u, v = uvs[i] if uvs else (0.0, 0.0)
-            if i * stream0_stride + 16 <= orig_s0_sz:
-                struct.pack_into('<ff', patched_gpu, i * stream0_stride + 8, u, v)
-                
-        # 2. Overwrite XYZs in Stream 1
-        s1_start = orig_s0_sz
-        s1_size = real_nv * 28
-        if s1_start + s1_size <= len(patched_gpu):
-            for i in range(real_nv):
-                struct.pack_into('<fff', patched_gpu, s1_start + i * 28, verts[i][0], verts[i][1], verts[i][2])
-                
-        # Return the perfectly patched GPU and the unchanged Primary
-        return bytes(patched_gpu), original_primary_bytes
-
-    # --- FALLBACK FOR CHANGED VERTEX COUNT ---
     if max_orig_vc > real_nv:
         padding_count = max_orig_vc - real_nv
         last_v = verts[-1] if verts else (0.0, 0.0, 0.0)
@@ -572,6 +593,9 @@ def encode_primary_described_full_replace(
         if uvs:
             last_uv = uvs[-1] if uvs else (0.0, 0.0)
             uvs = list(uvs) + [last_uv] * padding_count
+        if bone_data:
+            last_bone = bone_data[-1] if bone_data else ((0,0,0,0), (0,0,0,0))
+            bone_data = list(bone_data) + [last_bone] * padding_count
 
     nv = len(verts)
     nt = len(faces)
@@ -586,8 +610,7 @@ def encode_primary_described_full_replace(
     ib = _pack_index_buffer_u16(faces)
     new_gpu = bytearray(s0 + s1 + ib)
 
-    # Pad to original size
-    orig_gpu_size = len(original_gpu_bytes)
+    # Pad to original size ONLY if smaller. If larger, we just let it be larger.
     if len(new_gpu) < orig_gpu_size:
         new_gpu += b'\x00' * (orig_gpu_size - len(new_gpu))
     
@@ -595,7 +618,48 @@ def encode_primary_described_full_replace(
     index_offset  = stream0_size + nv * 28
     index_count   = nt * 3
 
+    # --- Bounding Box Patching ---
+    # Calculate original bounds to find where they are stored in the Primary file
+    orig_xs, orig_ys, orig_zs = [], [], []
+    if orig_s0_sz > 0 and max_orig_vc > 0:
+        for i in range(max_orig_vc):
+            off = orig_s0_sz + i * 28
+            if off + 12 <= len(original_gpu_bytes):
+                x, y, z = struct.unpack_from('<fff', original_gpu_bytes, off)
+                orig_xs.append(x); orig_ys.append(y); orig_zs.append(z)
+                
     patched_primary = bytearray(original_primary_bytes)
+    
+    if orig_xs and orig_ys and orig_zs:
+        orig_bounds = (min(orig_xs), min(orig_ys), min(orig_zs), max(orig_xs), max(orig_ys), max(orig_zs))
+        
+        # Calculate new bounds
+        new_xs = [v[0] for v in verts]; new_ys = [v[1] for v in verts]; new_zs = [v[2] for v in verts]
+        new_bounds = (min(new_xs), min(new_ys), min(new_zs), max(new_xs), max(new_ys), max(new_zs))
+        
+        # Find the best matching bounding box in the Primary file
+        best_off = -1
+        best_diff = float('inf')
+        for off in range(0, len(patched_primary) - 24, 4):
+            vals = struct.unpack_from('<ffffff', patched_primary, off)
+            if vals[0] < vals[3] and vals[1] < vals[4] and vals[2] < vals[5]:
+                diff = sum(abs(a - b) for a, b in zip(vals, orig_bounds))
+                if diff < best_diff and diff < 1.0: # Must be reasonably close
+                    best_diff = diff
+                    best_off = off
+                    
+        # If we found the LOD0 bounding box, patch it and all subsequent LOD bounding boxes (stride 0x98)
+        if best_off != -1:
+            curr_off = best_off
+            while curr_off + 24 <= len(patched_primary):
+                vals = struct.unpack_from('<ffffff', patched_primary, curr_off)
+                # Check if it looks like a bounding box
+                if vals[0] < vals[3] and vals[1] < vals[4] and vals[2] < vals[5]:
+                    struct.pack_into('<ffffff', patched_primary, curr_off, *new_bounds)
+                    curr_off += 0x98
+                else:
+                    break
+
     for off in range(0, n_meta - 60, 4):
         val = struct.unpack_from('<I', patched_primary, off)[0]
         if val == 0x0B:
@@ -603,9 +667,43 @@ def encode_primary_described_full_replace(
             vc2 = struct.unpack_from('<I', patched_primary, off + 8*4)[0]
             vc3 = struct.unpack_from('<I', patched_primary, off + 11*4)[0]
             if vc == vc2 == vc3 and vc > 0:
-                for field_index, value in [(2,0), (4,stream0_size), (7,nv), (8,nv), (11,nv), (12,index_offset), (13,index_count)]:
+                orig_ioff = struct.unpack_from('<I', patched_primary, off + 12*4)[0]
+                orig_vc = vc
+                
+                # Update the vertex buffer layout for ALL blocks so they point to our new mesh buffer.
+                # This ensures the engine correctly calculates stream strides and doesn't read NaNs.
+                for field_index, value in [(2,0), (4,stream0_size), (7,nv), (8,nv), (11,nv)]:
                     struct.pack_into('<I', patched_primary, off + field_index * 4, value)
+                    
+                if orig_ioff < orig_gpu_size:
+                    for field_index, value in [(12,index_offset), (13,index_count)]:
+                        struct.pack_into('<I', patched_primary, off + field_index * 4, value)
 
+                # 3. Patch Stream Records (matching orig_vc)
+                for soff in range(0, n_meta - 32, 8):
+                    if struct.unpack_from('<I', patched_primary, soff)[0] == 4:
+                        if struct.unpack_from('<I', patched_primary, soff + 2*4)[0] == orig_vc:
+                            struct.pack_into('<I', patched_primary, soff + 2*4, nv)
+                            struct.pack_into('<I', patched_primary, soff + 4*4, index_count)
+
+    # --- Fallback Metadata Patching (for CGML-like CIMR files) ---
+    # 1. Patch 0xFFFFFF0C descriptors
+    for off in range(0, n_meta - 64 + 1, 4):
+        if struct.unpack_from('<I', patched_primary, off)[0] == 0xffffff0c and struct.unpack_from('<I', patched_primary, off + 4)[0] == 0xffffffff:
+            kind = struct.unpack_from('<I', patched_primary, off + 8)[0]
+            if kind in (11, 13) and struct.unpack_from('<I', patched_primary, off + 12)[0] == 0:
+                struct.pack_into('<I', patched_primary, off + 16, 0) # base_offset
+                struct.pack_into('<I', patched_primary, off + 24, stream0_size)
+                struct.pack_into('<I', patched_primary, off + 36, nv)
+                struct.pack_into('<I', patched_primary, off + 40, nv)
+
+    # 2. Patch index records (idx_off, idx_count, r_kind, r_extra)
+    for off in range(0, n_meta - 16 + 1, 4):
+        idx_off, idx_count, r_kind, r_extra = struct.unpack_from("<IIII", patched_primary, off)
+        if r_kind in (2, 4) and r_extra == 0 and idx_count >= 3 and idx_count % 3 == 0 and idx_off >= 1024 and idx_off % 2 == 0:
+            struct.pack_into('<I', patched_primary, off, index_offset)
+            struct.pack_into('<I', patched_primary, off + 4, index_count)
+            
     return bytes(new_gpu), bytes(patched_primary)
 
 def encode_primary_described_multi_submesh_replace(
@@ -613,7 +711,8 @@ def encode_primary_described_multi_submesh_replace(
         original_primary_bytes,
         submesh_list,
         stream0_stride=None,
-        compute_normals=True):
+        compute_normals=True,
+        enforce_size_limit=True):
     import struct
 
     expected_blocks = []
@@ -711,6 +810,9 @@ def encode_primary_described_multi_submesh_replace(
     if len(new_gpu) < orig_gpu_size:
         padding = orig_gpu_size - len(new_gpu)
         new_gpu += b'\x00' * padding
+    elif len(new_gpu) > orig_gpu_size:
+        if enforce_size_limit:
+            raise EncodeSizeError(len(new_gpu), orig_gpu_size)
 
     patched_primary = bytearray(original_primary_bytes)
     block_index = 0
@@ -799,7 +901,7 @@ def patch_primary_described_positions(original_gpu_bytes, original_primary_bytes
 
     return bytes(patched), original_primary_bytes
 
-def encode_cgml_primary_replace(original_gpu_bytes, original_primary_bytes, submesh_list, stream0_stride=None, compute_normals=False):
+def encode_cgml_primary_replace(original_gpu_bytes, original_primary_bytes, submesh_list, stream0_stride=None, compute_normals=False, enforce_size_limit=True):
     import struct
     import math
 
@@ -970,12 +1072,13 @@ def encode_cgml_primary_replace(original_gpu_bytes, original_primary_bytes, subm
             min_z, max_z = min(zs), max(zs)
             struct.pack_into("<ffffff", patched_primary, a0_off + 0x3c, min_x, min_y, min_z, max_x, max_y, max_z)
 
-    # Pad GPU binary to exact original size
+    # Pad GPU binary to exact original size if smaller
     orig_gpu_size = len(original_gpu_bytes)
     if len(new_gpu) < orig_gpu_size:
         new_gpu += b"\x00" * (orig_gpu_size - len(new_gpu))
     elif len(new_gpu) > orig_gpu_size:
-        raise ValueError(f"New GPU size {len(new_gpu)} is larger than original {orig_gpu_size}. Please decimate the mesh further.")
+        if enforce_size_limit:
+            raise EncodeSizeError(len(new_gpu), orig_gpu_size)
 
     return bytes(new_gpu), bytes(patched_primary)
 
