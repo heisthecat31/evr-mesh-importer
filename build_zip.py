@@ -25,7 +25,8 @@ out_dir.mkdir(exist_ok=True)
 out = out_dir / f"evr_mesh_importer_v{version}.zip"
 
 with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-    for f in sorted(src.rglob("*.py")):
-        zf.write(f)
+    for ext in ("*.py", "*.json"):
+        for f in sorted(src.rglob(ext)):
+            zf.write(f)
 
 print(f"Built {out}  ({out.stat().st_size // 1024} KB)")

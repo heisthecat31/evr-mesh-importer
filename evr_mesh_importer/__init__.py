@@ -7,7 +7,7 @@ https://github.com/Dualgame/evr-mesh-importer
 bl_info = {
     "name": "EVR Raw Mesh Importer",
     "author": "Dualgame",
-    "version": (1, 2, 5),
+    "version": (1, 3, 0),
     "blender": (3, 0, 0),
     "location": "File > Import/Export > EVR Raw Mesh",
     "description": "Import/export raw GPU mesh binaries from Echo VR (Echo Arena)",
@@ -20,15 +20,16 @@ import bpy
 import os
 import sys
 import importlib
+import shutil
 
-_submodules = ["decode", "primary", "encode", "textures"]
+_submodules = ["decode", "primary", "encode", "textures", "collision_decode"]
 for _sub in _submodules:
     _full_name = f"{__package__}.{_sub}" if __package__ else _sub
     if _full_name in sys.modules:
         importlib.reload(sys.modules[_full_name])
 
 from bpy_extras.io_utils import ImportHelper, ExportHelper
-from bpy.props import (StringProperty, BoolProperty, FloatProperty, CollectionProperty, EnumProperty)
+from bpy.props import (StringProperty, BoolProperty, FloatProperty, CollectionProperty, EnumProperty, IntProperty)
 from bpy.types import Operator
 
 from .decode import extract_mesh
@@ -93,24 +94,34 @@ class EVR_OT_ImportMesh(Operator, ImportHelper):
     texture_cache_dir: StringProperty(name="Texture Cache Folder", default="", subtype='DIR_PATH')
     flip_texture_v: BoolProperty(name="Flip Texture V", default=True)
     import_lod0_only: BoolProperty(name="Import LOD0 Only", default=True)
+    import_collision: BoolProperty(name="Import Collision Data (Experimental)", default=False)
     texture_group_mode: EnumProperty(
         name="Texture Grouping",
         items=[
             ('sequential', "Sequential Texture List", "Use texture groups in raw mapping order, matching the verified Doug import"),
             ('binding', "Binding Table", "Use the mapping binding table to choose each group's texture slots"),
         ],
-        default='sequential',
+        default='binding',
     )
     material_assign_mode: EnumProperty(
         name="Material Assignment",
         items=[
+            ('perfect_uv', "Base Color Only", "Applies ONLY the single best matching Base Color texture per mesh"),
+            ('detailed_orm', "Detailed Map Only (ORM)", "Applies ONLY the detailed ORM map (scratches, shadows) as the main texture. Perfect for customizable models."),
             ('uv_scanner', "Dynamic UV Scanner", "Dynamically scan texture PNGs and assign materials based on UV layout"),
-            ('auto', "Auto", "Skin 0 for LOD/single imports, submesh order for multi-part imports"),
-            ('first', "Force Skin 0", "Apply the first texture group to every imported mesh"),
-            ('submesh', "By Submesh Order", "Apply Skin 0 to mesh .000, Skin 1 to mesh .001, and so on"),
-            ('reverse', "Reverse Submesh Order", "Apply texture groups in reverse mesh order"),
+            ('auto', "Auto", "Automatically apply materials based on best guess (uses Skin 0 if available)"),
+            ('first', "Force Skin 0", "Force the first skin (Skin 0) material onto all submeshes"),
+            ('submesh', "Submesh Order", "Apply materials sequentially matching submesh index"),
+            ('reverse', "Reverse Submesh Order", "Apply materials in reverse submesh order"),
         ],
-        default='uv_scanner',
+        default='auto',
+    )
+    force_skin_index: IntProperty(
+        name="Force Skin Index",
+        description="When using 'Auto' or 'Force Skin' mode, forces a specific Skin index onto the entire model. Useful if the model defaults to the wrong variant. Set to -1 to disable.",
+        default=-1,
+        min=-1,
+        max=50
     )
     use_smooth: BoolProperty(name="Smooth Shading", default=False)
     scale: FloatProperty(name="Scale", default=1.0, min=0.0001, max=10000.0)
@@ -169,6 +180,7 @@ class EVR_OT_ImportMesh(Operator, ImportHelper):
             faces = sub[1]
             uvs = sub[2] if len(sub) > 2 else None
             bone_data = sub[3] if len(sub) > 3 else None
+            colors = sub[4] if len(sub) > 4 else None
             if not verts or not faces: continue
             if self.scale != 1.0: verts = [(x * self.scale, y * self.scale, z * self.scale) for x, y, z in verts]
             name = base_name if parent_empty is None else f"{base_name}.{idx:03d}"
@@ -195,14 +207,66 @@ class EVR_OT_ImportMesh(Operator, ImportHelper):
                             vgs[b_idx].add([v_idx], weight / 255.0, 'REPLACE')
             if not self.use_smooth: _apply_flat_shading(obj)
             
+            if colors and obj.data:
+                if hasattr(obj.data, "color_attributes"):
+                    color_layer0 = obj.data.color_attributes.new(name="word0", type='BYTE_COLOR', domain='CORNER')
+                    color_layer1 = obj.data.color_attributes.new(name="word1", type='BYTE_COLOR', domain='CORNER')
+                    for poly in obj.data.polygons:
+                        for loop_idx in poly.loop_indices:
+                            v_idx = obj.data.loops[loop_idx].vertex_index
+                            if v_idx < len(colors):
+                                color_layer0.data[loop_idx].color = colors[v_idx][0]
+                                color_layer1.data[loop_idx].color = colors[v_idx][1]
+            
             if hasattr(obj.data, "attributes"):
                 attr = obj.data.attributes.new(name="cgml_submesh", type='INT', domain='FACE')
                 for p in obj.data.polygons:
                     attr.data[p.index].value = idx
                     
             obj["evr_material_index"] = idx
+            # Store import paths on each mesh so texture replacement can find them later
+            if self.pcvr_extracted_dir.strip():
+                obj["evr_pcvr_extracted"] = bpy.path.abspath(self.pcvr_extracted_dir)
+            if self.texture_cache_dir.strip():
+                obj["evr_texture_cache"] = bpy.path.abspath(self.texture_cache_dir)
+            obj["evr_gpu_path"] = gpu_path
             if parent_empty: obj.parent = parent_empty
             created.append(obj)
+
+        has_bones = any(len(obj.vertex_groups) > 0 for obj in created)
+        arm_obj = None
+        if has_bones:
+            bone_names = set()
+            for obj in created:
+                for vg in obj.vertex_groups:
+                    bone_names.add(vg.name)
+            
+            arm_data = bpy.data.armatures.new(name=f"{base_name}_Armature")
+            arm_obj = bpy.data.objects.new(f"{base_name}_Armature", arm_data)
+            bpy.context.collection.objects.link(arm_obj)
+            
+            # Deselect all and select armature to go to EDIT mode
+            for o in bpy.context.selected_objects: o.select_set(False)
+            arm_obj.select_set(True)
+            bpy.context.view_layer.objects.active = arm_obj
+            bpy.ops.object.mode_set(mode='EDIT')
+            
+            for b_name in sorted(list(bone_names)):
+                bone = arm_data.edit_bones.new(b_name)
+                bone.head = (0, 0, 0)
+                bone.tail = (0, 0, 0.1)
+                
+            bpy.ops.object.mode_set(mode='OBJECT')
+            
+            for obj in created:
+                mod = obj.modifiers.new(name="Armature", type='ARMATURE')
+                mod.object = arm_obj
+                
+            if parent_empty:
+                parent_empty.parent = arm_obj
+            else:
+                for obj in created:
+                    obj.parent = arm_obj
 
         if self.auto_apply_textures and created:
             try:
@@ -213,6 +277,7 @@ class EVR_OT_ImportMesh(Operator, ImportHelper):
                     created,
                     texture_group_mode=self.texture_group_mode,
                     material_assign_mode=self.material_assign_mode,
+                    force_skin_index=self.force_skin_index,
                 )
                 if applied:
                     self.report({'INFO'}, f"Applied {applied} texture material(s) to {base_name}")
@@ -221,7 +286,70 @@ class EVR_OT_ImportMesh(Operator, ImportHelper):
             except Exception as exc:
                 self.report({'WARNING'}, f"Imported {base_name}, but texture auto-apply failed: {exc}")
 
-        return parent_empty if parent_empty else created[0] if created else None
+        if self.import_collision:
+            p_ext = bpy.path.abspath(self.pcvr_extracted_dir) if self.pcvr_extracted_dir.strip() else ""
+            if not p_ext:
+                from .textures import discover_paths
+                disc = discover_paths()
+                p_ext = disc.get("pcvr_extracted", "")
+                
+            if p_ext and os.path.exists(p_ext):
+                col_folder = os.path.join(p_ext, "b7d338793fa37832")
+                if os.path.exists(col_folder):
+                    from .textures import get_all_name_variations
+                    col_vars = get_all_name_variations(base_name)
+                    col_file = None
+                    for v in col_vars:
+                        cand = os.path.join(col_folder, v)
+                        if os.path.exists(cand):
+                            col_file = cand
+                            break
+                    if col_file:
+                        try:
+                            from .collision_decode import extract_collision_heuristic
+                            col_verts = extract_collision_heuristic(col_file)
+                            if col_verts:
+                                if self.scale != 1.0:
+                                    col_verts = [(x * self.scale, y * self.scale, z * self.scale) for x, y, z in col_verts]
+                                
+                                # Create triangle soup to make wireframe visible
+                                col_faces = []
+                                for i in range(0, len(col_verts) - 2, 3):
+                                    col_faces.append((i, i+1, i+2))
+                                    
+                                col_mesh = bpy.data.meshes.new(f"{base_name}_Collision")
+                                col_mesh.from_pydata(col_verts, [], col_faces)
+                                col_mesh.update()
+                                col_obj = bpy.data.objects.new(f"{base_name}_Collision", col_mesh)
+                                bpy.context.collection.objects.link(col_obj)
+                                
+                                # Setup wireframe display
+                                col_obj.display_type = 'WIRE'
+                                col_obj.show_in_front = True
+                                
+                                # Make it bright green
+                                mat = bpy.data.materials.new(name="EVR_Collision_Mat")
+                                mat.use_nodes = True
+                                bsdf = mat.node_tree.nodes.get("Principled BSDF")
+                                if bsdf:
+                                    if 'Base Color' in bsdf.inputs: bsdf.inputs['Base Color'].default_value = (0, 1, 0, 1)
+                                    if 'Emission Color' in bsdf.inputs: bsdf.inputs['Emission Color'].default_value = (0, 1, 0, 1)
+                                    if 'Emission Strength' in bsdf.inputs: bsdf.inputs['Emission Strength'].default_value = 2.0
+                                col_obj.data.materials.append(mat)
+                                
+                                if parent_empty:
+                                    col_obj.parent = parent_empty
+                                else:
+                                    parent_empty = bpy.data.objects.new(base_name, None)
+                                    bpy.context.collection.objects.link(parent_empty)
+                                    if created: created[0].parent = parent_empty
+                                    col_obj.parent = parent_empty
+                                    
+                                self.report({'INFO'}, f"Imported {len(col_verts)} collision points.")
+                        except Exception as e:
+                            self.report({'WARNING'}, f"Collision import failed: {e}")
+
+        return arm_obj if arm_obj else parent_empty if parent_empty else created[0] if created else None
 
 def menu_func_import(self, context): self.layout.operator(EVR_OT_ImportMesh.bl_idname, text="EVR Raw Mesh")
 
@@ -241,6 +369,16 @@ class EVR_ExportSettings(bpy.types.PropertyGroup):
         description="Where the output folders and files will be saved",
         subtype='DIR_PATH',
         default=r"C:\Echovr\input-pcvr"
+    )
+    pcvr_extracted_dir: StringProperty(
+        name="PCVR Extracted Folder",
+        description="Path to your pcvr-extracted directory containing model mappings",
+        subtype='DIR_PATH',
+    )
+    texture_cache_dir: StringProperty(
+        name="Preview Cache Dir",
+        description="Folder containing .dds files to show as previews for texture replacement",
+        subtype='DIR_PATH',
     )
     encode_mode: EnumProperty(
         name="Encode Mode",
@@ -349,6 +487,8 @@ class EVR_PT_ExportPanel(bpy.types.Panel):
 
         layout.prop(settings, "original_gpu_file")
         layout.prop(settings, "export_dir")
+        layout.prop(settings, "pcvr_extracted_dir")
+        layout.prop(settings, "texture_cache_dir")
         layout.separator()
         layout.prop(settings, "encode_mode")
         if settings.encode_mode == 'primary_described':
@@ -363,7 +503,10 @@ class EVR_PT_ExportPanel(bpy.types.Panel):
         row = layout.row()
         row.operator("evr.transfer_weights", text="Transfer Weights", icon='MOD_DATA_TRANSFER')
         layout.separator()
+        layout.separator()
         layout.operator("export_mesh.evr_raw", text="Export Mesh (Replace)", icon='EXPORT')
+        layout.operator("export_mesh.evr_replace_textures", text="Replace Textures for this Model", icon='TEXTURE')
+        layout.operator("evr.dump_model_data", text="Dump Textures & .blend", icon='PACKAGE')
 
 
 class EVR_OT_ExportMesh(Operator):
@@ -436,6 +579,7 @@ class EVR_OT_ExportMesh(Operator):
                     res = mesh_from_blender_object(obj, apply_transforms=True, split_by_material=False, decimate_ratio=ratio)
                     verts, faces, uvs = res[0], res[1], res[2]
                     bone_data = res[3] if len(res) > 3 else None
+                    colors = res[4] if len(res) > 4 else None
 
                 if settings.scale != 1.0:
                     s = settings.scale
@@ -448,10 +592,10 @@ class EVR_OT_ExportMesh(Operator):
                 os.makedirs(out_gpu_dir, exist_ok=True)
 
                 if settings.encode_mode == 'heuristic_s16':
-                    self._write_gpu(out_gpu_path, encode_heuristic_s16(verts, faces, uvs=uvs, bone_data=bone_data, compute_normals=cn))
+                    self._write_gpu(out_gpu_path, encode_heuristic_s16(verts, faces, uvs=uvs, bone_data=bone_data, colors=colors, compute_normals=cn))
                     self.report({'INFO'}, f"Saved GPU to {out_gpu_path}")
                 elif settings.encode_mode == 'heuristic_s20':
-                    self._write_gpu(out_gpu_path, encode_heuristic_s20(verts, faces, uvs=uvs, bone_data=bone_data, compute_normals=cn))
+                    self._write_gpu(out_gpu_path, encode_heuristic_s20(verts, faces, uvs=uvs, bone_data=bone_data, colors=colors, compute_normals=cn))
                     self.report({'INFO'}, f"Saved GPU to {out_gpu_path}")
                 elif settings.encode_mode == 'heuristic_dual28':
                     self._write_gpu(out_gpu_path, encode_heuristic_dual28(verts, faces, bone_data=bone_data, compute_normals=cn))
@@ -476,7 +620,7 @@ class EVR_OT_ExportMesh(Operator):
                         else:
                             from .encode import encode_primary_described_full_replace
                             gpu_data, primary_data = encode_primary_described_full_replace(
-                                orig_gpu, orig_primary, verts, faces, uvs=uvs, bone_data=bone_data, stream0_stride=s0_stride, compute_normals=cn
+                                orig_gpu, orig_primary, verts, faces, uvs=uvs, bone_data=bone_data, colors=colors, stream0_stride=s0_stride, compute_normals=cn
                             )
 
                         self._write_gpu(out_gpu_path, gpu_data)
@@ -516,13 +660,721 @@ class EVR_OT_ExportMesh(Operator):
 
 def menu_func_export(self, context): self.layout.operator(EVR_OT_ExportMesh.bl_idname, text="EVR Raw Mesh (Replace)")
 
+class EVR_AssetSwapperSettings(bpy.types.PropertyGroup):
+    target_hash: StringProperty(
+        name="Target Hash",
+        description="The hash of the model you are replacing (e.g. your custom prop)",
+        default=""
+    )
+    source_hash: StringProperty(
+        name="Source Hash",
+        description="The hash of the game object whose properties/collisions you want to steal",
+        default=""
+    )
+    swap_collision: BoolProperty(
+        name="Swap Collision Mesh",
+        description="Transfers the Havok collision geometry from the source to the target",
+        default=True
+    )
+    swap_def: BoolProperty(
+        name="Swap Model Definition",
+        description="Transfers the physics weight, mass, and surface properties from the source to the target",
+        default=True
+    )
+    extracted_dir: StringProperty(
+        name="PCVR Extracted Dir",
+        description="Directory containing the extracted game folders (e.g. G:\\pcvr-extracted)",
+        subtype='DIR_PATH',
+        default=r"G:\pcvr-extracted"
+    )
+
+class EVR_OT_SwapAssets(Operator):
+    """Swap collisions and physics definitions using Hash Spoofing"""
+    bl_idname = "evr.swap_assets"
+    bl_label = "Spoof Hashes (Apply Swap)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.evr_swapper_settings
+        extracted_dir = bpy.path.abspath(settings.extracted_dir)
+        
+        target = settings.target_hash.strip()
+        source = settings.source_hash.strip()
+        
+        if not target or not source:
+            self.report({'ERROR'}, "Both Target Hash and Source Hash must be provided.")
+            return {'CANCELLED'}
+            
+        if not os.path.exists(extracted_dir):
+            self.report({'ERROR'}, f"Extracted directory not found: {extracted_dir}")
+            return {'CANCELLED'}
+
+        from .textures import get_all_name_variations
+        
+        target_vars = get_all_name_variations(target)
+        source_vars = get_all_name_variations(source)
+        
+        folders_to_swap = []
+        if settings.swap_collision:
+            folders_to_swap.append(('b7d338793fa37832', "Collision Mesh"))
+        if settings.swap_def:
+            folders_to_swap.append(('46adff5980245670', "Model Definition"))
+            
+        success_count = 0
+        
+        for folder, name in folders_to_swap:
+            folder_path = os.path.join(extracted_dir, folder)
+            if not os.path.exists(folder_path):
+                self.report({'WARNING'}, f"{name} folder not found in extracted dir.")
+                continue
+                
+            # Find the source file
+            source_file = None
+            for var in source_vars:
+                cand = os.path.join(folder_path, var)
+                if os.path.exists(cand):
+                    source_file = cand
+                    break
+                    
+            if not source_file:
+                self.report({'WARNING'}, f"Could not find {name} for Source Hash in {folder}.")
+                continue
+                
+            target_name = None
+            for var in target_vars:
+                if len(var) == len(os.path.basename(source_file)):
+                    target_name = var
+                    break
+            if not target_name: target_name = target
+            
+            target_file = os.path.join(folder_path, target_name)
+            
+            try:
+                shutil.copy2(source_file, target_file)
+                self.report({'INFO'}, f"Copied {name} from {os.path.basename(source_file)} to {target_name}")
+                success_count += 1
+            except Exception as e:
+                self.report({'ERROR'}, f"Failed to copy {name}: {e}")
+                
+        if success_count > 0:
+            self.report({'INFO'}, f"Successfully swapped {success_count} asset(s)!")
+            return {'FINISHED'}
+        else:
+            self.report({'WARNING'}, "No assets were swapped.")
+            return {'CANCELLED'}
+
+class EVR_OT_DumpModelData(Operator):
+    bl_idname = "evr.dump_model_data"
+    bl_label = "Dump Textures & .blend"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    directory: StringProperty(subtype='DIR_PATH')
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object and context.active_object.type in {'MESH', 'ARMATURE', 'EMPTY'}
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        obj = context.active_object
+        dump_dir = self.directory
+        if not dump_dir:
+            return {'CANCELLED'}
+            
+        if not os.path.isdir(dump_dir):
+            os.makedirs(dump_dir, exist_ok=True)
+            
+        objs_to_export = []
+        def collect_children(o):
+            if o not in objs_to_export:
+                objs_to_export.append(o)
+                for child in o.children:
+                    collect_children(child)
+                    
+        # Find root of the selected object hierarchy
+        root = obj
+        while root.parent:
+            root = root.parent
+        collect_children(root)
+        
+        copied_images = {}
+        for o in objs_to_export:
+            if o.type == 'MESH':
+                for mat_slot in o.material_slots:
+                    if mat_slot.material and mat_slot.material.use_nodes:
+                        for node in mat_slot.material.node_tree.nodes:
+                            if node.type == 'TEX_IMAGE' and node.image:
+                                img = node.image
+                                if img.filepath and img.name not in copied_images:
+                                    src = bpy.path.abspath(img.filepath)
+                                    if os.path.exists(src):
+                                        basename = os.path.basename(src)
+                                        dst = os.path.join(dump_dir, basename)
+                                        try:
+                                            import shutil
+                                            shutil.copy2(src, dst)
+                                            copied_images[img.name] = dst
+                                        except Exception as e:
+                                            print(f"Failed to copy texture: {e}")
+
+        original_paths = {}
+        for img_name, dst in copied_images.items():
+            img = bpy.data.images.get(img_name)
+            if img:
+                original_paths[img.name] = img.filepath
+                img.filepath = "//" + os.path.basename(dst)
+                
+        blend_path = os.path.join(dump_dir, f"{root.name}_dump.blend")
+        try:
+            bpy.data.libraries.write(blend_path, set(objs_to_export), fake_user=True)
+            self.report({'INFO'}, f"Dumped to {dump_dir}")
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to dump blend: {e}")
+            
+        for img_name, orig_path in original_paths.items():
+            img = bpy.data.images.get(img_name)
+            if img:
+                img.filepath = orig_path
+
+        return {'FINISHED'}
+
+class EVR_PT_AssetSwapperPanel(bpy.types.Panel):
+    bl_label = "Asset Swapper (Collisions)"
+    bl_idname = "EVR_PT_asset_swapper_panel"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "EVR Tools"
+
+    def draw(self, context):
+        layout = self.layout
+        settings = context.scene.evr_swapper_settings
+
+        layout.label(text="Implicit Hash Spoofing", icon='FILE_REFRESH')
+        
+        box = layout.box()
+        box.prop(settings, "target_hash")
+        box.prop(settings, "source_hash")
+        
+        layout.separator()
+        layout.prop(settings, "extracted_dir")
+        
+        layout.separator()
+        layout.label(text="Properties to Steal:")
+        row = layout.row()
+        row.prop(settings, "swap_collision")
+        row.prop(settings, "swap_def")
+        
+        layout.separator()
+        layout.operator("evr.swap_assets", icon='UV_SYNC_SELECT')
+
+
+# --- TEXTURE REPLACEMENT UI ---
+import json
+import random
+import struct
+
+_texture_items_cache = {}
+_global_texture_mapping = None
+
+def _get_global_texture_mapping():
+    global _global_texture_mapping
+    if _global_texture_mapping is not None:
+        return _global_texture_mapping
+        
+    _global_texture_mapping = {}
+    _dir = os.path.dirname(os.path.abspath(__file__))
+    if os.path.basename(_dir) == "__pycache__":
+        _dir = os.path.dirname(_dir)
+        
+    mapping_path = os.path.join(_dir, "texture_mapping.json")
+    if os.path.exists(mapping_path):
+        try:
+            with open(mapping_path, 'r') as f:
+                _global_texture_mapping = json.load(f)
+        except Exception as e:
+            print(f"[EVR Mesh Importer] Error loading texture_mapping.json: {e}")
+            
+    return _global_texture_mapping
+
+def _resolve_pcvr_dir(context, orig_path):
+    import os
+    from .textures import discover_paths, get_all_name_variations
+    
+    def _is_valid(p):
+        if not p or not os.path.exists(p): return False
+        for h in ("c2434c5a99e139ce", "23d48cecc462abe7"):
+            for v in get_all_name_variations(h):
+                if os.path.exists(os.path.join(p, v)): return True
+        return False
+
+    # 1. Use user's explicit setting from the export panel
+    if hasattr(context, "scene") and hasattr(context.scene, "evr_export_settings"):
+        p = context.scene.evr_export_settings.pcvr_extracted_dir
+        if _is_valid(p): return p
+
+    # 2. Check if mesh has the pcvr extracted dir stored from import
+    if hasattr(context, "active_object") and context.active_object and context.active_object.get("evr_pcvr_extracted"):
+        p = context.active_object["evr_pcvr_extracted"]
+        if _is_valid(p): return p
+
+    # 3. Derive from original GPU file path
+    if orig_path:
+        p = os.path.dirname(os.path.dirname(orig_path))
+        if _is_valid(p): return p
+
+    # 4. Fallback to discover_paths
+    disc = discover_paths()
+    p = disc.get('pcvr_extracted')
+    if _is_valid(p): return p
+    
+    # Best effort fallback (even if invalid)
+    if orig_path:
+        return os.path.dirname(os.path.dirname(orig_path))
+    return None
+
+def get_texture_items(self, context):
+    orig_path = context.scene.evr_export_settings.original_gpu_file
+    if not orig_path or not os.path.isfile(orig_path): return [("NONE", "No Original GPU File set", "")]
+    model_hash = os.path.splitext(os.path.basename(orig_path))[0]
+    if model_hash in _texture_items_cache:
+        return _texture_items_cache[model_hash]
+    
+    from .textures import parse_materials_mapping, get_all_name_variations, discover_paths
+    
+    pcvr_dir = _resolve_pcvr_dir(context, orig_path)
+    
+    if not pcvr_dir or not os.path.exists(pcvr_dir):
+        return [("NONE", "PCVR Extracted Dir not found", "")]
+        
+    mapping = parse_materials_mapping(pcvr_dir, model_hash)
+    
+    items = []
+    if mapping and mapping.get('textures'):
+        # Build search dirs: combine texture caches, local texture/ folder, AND pcvr-extracted subfolders
+        user_cache = context.scene.evr_export_settings.texture_cache_dir
+        obj_cache = None
+        if hasattr(context, "active_object") and context.active_object and context.active_object.get("evr_texture_cache"):
+            obj_cache = context.active_object["evr_texture_cache"]
+        
+        t_cache = bpy.path.abspath(user_cache).strip() if user_cache else None
+        
+        search_dirs = []
+        if obj_cache and os.path.exists(obj_cache) and obj_cache not in search_dirs:
+            search_dirs.append(obj_cache)
+        if t_cache and os.path.exists(t_cache) and t_cache not in search_dirs:
+            search_dirs.append(t_cache)
+        # ALSO search the addon's local texture/ directory for converted DDS files
+        # This works both when running from source checkout AND when installed in Blender
+        local_tex_found = False
+        for search_root in [os.path.dirname(os.path.dirname(os.path.abspath(__file__))), os.path.dirname(os.path.abspath(__file__))]:
+            local_tex_dir = os.path.join(search_root, "texture")
+            if os.path.exists(local_tex_dir) and local_tex_dir not in search_dirs:
+                search_dirs.append(local_tex_dir)
+                local_tex_found = True
+                break
+        # Also check the common dev checkout path in case Blender's __file__ resolves differently
+        if not local_tex_found:
+            for alt in [r"J:\EchoVR-Tools-Launcher\evr-mesh-importer\texture"]:
+                if os.path.exists(alt) and alt not in search_dirs:
+                    search_dirs.append(alt)
+        # ALSO search pcvr-extracted texture subfolders (raw game textures, no DDS header)
+        if pcvr_dir and os.path.exists(pcvr_dir):
+            for sub in ["ae49fad43254367a", "4a4c32c49300b8a0"]:
+                sub_path = os.path.join(pcvr_dir, sub)
+                if os.path.isdir(sub_path) and sub_path not in search_dirs:
+                    search_dirs.append(sub_path)
+        
+        # Helper to find which textures are actually used on the active object's materials
+        assigned_vars = set()
+        try:
+            obj = getattr(context, "active_object", None)
+            if obj and obj.type == 'MESH':
+                for mat in obj.data.materials:
+                    if mat and mat.use_nodes:
+                        for node in mat.node_tree.nodes:
+                            if node.type == 'TEX_IMAGE' and node.image and node.image.filepath:
+                                name = os.path.splitext(os.path.basename(node.image.filepath))[0]
+                                assigned_vars.add(name.lower())
+        except Exception:
+            pass
+
+        # Load the global texture mapping to resolve metadata -> payload hashes
+        global_mapping = _get_global_texture_mapping()
+
+        found_hashes = []
+        for thash in set(mapping['textures']):
+            payload_hash = global_mapping.get(thash, thash)
+            
+            # variations for finding the file on disk
+            vars = get_all_name_variations(payload_hash)
+            meta_vars = get_all_name_variations(thash)
+
+            # We no longer filter by assigned_vars so that ALL textures for the model show up in the dropdown
+            # even if the material was deleted or the model hasn't been fully imported.
+            
+            # Priority order: first check user's explicitly-set cache dir for DDS,
+            # then check all other dirs
+            dds_path = None
+            raw_path = None
+            dds_size = -1
+            raw_size = -1
+            
+            # Phase 1: Only search user's explicit texture_cache_dir for DDS files
+            if t_cache and os.path.exists(t_cache):
+                for v in vars:
+                    p = os.path.join(t_cache, f"{v}.dds")
+                    if os.path.exists(p):
+                        sz = os.path.getsize(p)
+                        if sz > dds_size:
+                            dds_size = sz
+                            dds_path = p
+            
+            # Phase 2: Search all other dirs for any format
+            for d in search_dirs:
+                if d == t_cache: continue  # already searched
+                if not os.path.exists(d): continue
+                # Try .dds file
+                for v in vars:
+                    p = os.path.join(d, f"{v}.dds")
+                    if os.path.exists(p):
+                        sz = os.path.getsize(p)
+                        if sz > dds_size:
+                            dds_size = sz
+                            dds_path = p
+                # Try raw binary file (pcvr-extracted raw texture, no extension)
+                for v in vars:
+                    p = os.path.join(d, v)
+                    if os.path.exists(p) and os.path.isfile(p) and not v.endswith('.dds'):
+                        sz = os.path.getsize(p)
+                        if sz > raw_size:
+                            raw_size = sz
+                            raw_path = p
+            
+            # Always prefer DDS over raw for preview
+            if dds_size >= 0:
+                found_hashes.append((thash, payload_hash, dds_size, "DDS"))
+            elif raw_size >= 0:
+                found_hashes.append((thash, payload_hash, raw_size, "RAW"))
+        
+        # Sort by size descending so high quality textures are at the top, DDS preferred
+        found_hashes.sort(key=lambda x: (0 if x[3] == "DDS" else 1, -x[2]))
+        for thash, payload_hash, size, ftype in found_hashes:
+            
+            hash_display = f"{thash} -> {payload_hash}" if thash != payload_hash else thash
+            
+            if ftype == "RAW":
+                label = f"{hash_display} ({size/1024:.0f} KB - raw)"
+            else:
+                mb = size / (1024*1024)
+                if mb >= 1.0:
+                    label = f"{hash_display} ({mb:.1f} MB)"
+                else:
+                    label = f"{hash_display} ({size/1024:.0f} KB)"
+            items.append((thash, label, ""))
+            
+    if not items:
+        items = [("NONE", "No cached textures found", "")]
+    
+    _texture_items_cache[model_hash] = items
+    return items
+
+def update_texture_preview(self, context):
+    target_hash = self.texture_to_replace
+    if target_hash == "NONE":
+        context.scene.evr_preview_image = None
+        return
+        
+    import os
+    from .textures import get_all_name_variations, discover_paths
+    
+    # Build search dirs: combine texture caches, local texture/ folder, AND pcvr-extracted subfolders
+    user_cache = context.scene.evr_export_settings.texture_cache_dir
+    obj_cache = None
+    if hasattr(context, "active_object") and context.active_object and context.active_object.get("evr_texture_cache"):
+        obj_cache = context.active_object["evr_texture_cache"]
+
+    t_cache = bpy.path.abspath(user_cache).strip() if user_cache else None
+
+    search_dirs = []
+    if obj_cache and os.path.exists(obj_cache) and obj_cache not in search_dirs:
+        search_dirs.append(obj_cache)
+    if t_cache and os.path.exists(t_cache) and t_cache not in search_dirs:
+        search_dirs.append(t_cache)
+    # ALSO search the addon's local texture/ directory for converted DDS files
+    # This works both when running from source checkout AND when installed in Blender
+    local_tex_found = False
+    for search_root in [os.path.dirname(os.path.dirname(os.path.abspath(__file__))), os.path.dirname(os.path.abspath(__file__))]:
+        local_tex_dir = os.path.join(search_root, "texture")
+        if os.path.exists(local_tex_dir) and local_tex_dir not in search_dirs:
+            search_dirs.append(local_tex_dir)
+            local_tex_found = True
+            break
+    # Also check the common dev checkout path in case Blender's __file__ resolves differently
+    if not local_tex_found:
+        for alt in [r"J:\EchoVR-Tools-Launcher\evr-mesh-importer\texture"]:
+            if os.path.exists(alt) and alt not in search_dirs:
+                search_dirs.append(alt)
+    # ALSO search pcvr-extracted texture subfolders
+    pcvr_dir = _resolve_pcvr_dir(context, orig_path=context.scene.evr_export_settings.original_gpu_file)
+    if pcvr_dir and os.path.exists(pcvr_dir):
+        for sub in ["ae49fad43254367a", "4a4c32c49300b8a0"]:
+            sub_path = os.path.join(pcvr_dir, sub)
+            if os.path.isdir(sub_path) and sub_path not in search_dirs:
+                search_dirs.append(sub_path)
+    
+    preview_img = None
+    max_size = -1
+    
+    global_mapping = _get_global_texture_mapping()
+    payload_hash = global_mapping.get(target_hash, target_hash)
+    
+    vars_payload = get_all_name_variations(payload_hash)
+    vars_meta = get_all_name_variations(target_hash)
+    
+    for d in search_dirs:
+        if not os.path.exists(d): continue
+        for h_var in vars_payload + vars_meta:
+            # Try .dds first (cached DDS files)
+            p = os.path.join(d, h_var + ".dds")
+            if os.path.exists(p):
+                sz = os.path.getsize(p)
+                if sz > max_size:
+                    max_size = sz
+                    preview_img = p
+            # Also try raw binary (pcvr-extracted texture has no extension)
+            p_raw = os.path.join(d, h_var)
+            if os.path.exists(p_raw) and not p_raw.endswith(".dds"):
+                sz = os.path.getsize(p_raw)
+                if sz > max_size:
+                    max_size = sz
+                    preview_img = p_raw
+        
+        if preview_img:
+            try:
+                # Only load .dds for preview — raw Echo textures can't be loaded directly
+                if preview_img.lower().endswith('.dds'):
+                    img = bpy.data.images.load(preview_img, check_existing=True)
+                    img.preview_ensure()
+                    context.scene.evr_preview_image = img
+                else:
+                    # Raw texture in pcvr-extracted — try to find a .dds version in cache instead
+                    fallback = None
+                    for d in search_dirs:
+                        if not os.path.exists(d): continue
+                        for h_var in get_all_name_variations(target_hash):
+                            p_dds = os.path.join(d, h_var + ".dds")
+                            if os.path.exists(p_dds):
+                                fallback = p_dds
+                                break
+                        if fallback: break
+                    if fallback:
+                        img = bpy.data.images.load(fallback, check_existing=True)
+                        img.preview_ensure()
+                        context.scene.evr_preview_image = img
+                    else:
+                        context.scene.evr_preview_image = None
+            except Exception:
+                context.scene.evr_preview_image = None
+        else:
+            context.scene.evr_preview_image = None
+
+class EVR_OT_ReplaceTextures(bpy.types.Operator):
+    bl_idname = "export_mesh.evr_replace_textures"
+    bl_label = "Replace Textures for this Model"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    texture_to_replace: bpy.props.EnumProperty(
+        name="Texture to Replace",
+        description="Select which texture to replace",
+        items=get_texture_items,
+        update=update_texture_preview
+    )
+    
+    replacement_dds: bpy.props.StringProperty(
+        name="Replacement DDS",
+        description="Path to the new .dds file you want to use",
+        subtype='FILE_PATH'
+    )
+    
+    @classmethod
+    def poll(cls, context):
+        return context.active_object and context.active_object.type == 'MESH'
+
+    def invoke(self, context, event):
+        orig_path = context.scene.evr_export_settings.original_gpu_file
+        if not orig_path or not os.path.isfile(orig_path):
+            self.report({'ERROR'}, "Please set the 'Original GPU File' in the Export Panel first.")
+            return {'CANCELLED'}
+            
+        model_hash = os.path.splitext(os.path.basename(orig_path))[0]
+        
+        if model_hash in _texture_items_cache:
+            del _texture_items_cache[model_hash]
+            
+        items = get_texture_items(self, context)
+        if not items or items[0][0] == "NONE":
+            self.report({'ERROR'}, f"No textures found for model {model_hash}")
+            return {'CANCELLED'}
+            
+        # Force the initial preview update
+        if items and items[0][0] != "NONE":
+            self.texture_to_replace = items[0][0]
+            update_texture_preview(self, context)
+        else:
+            context.scene.evr_preview_image = None
+            
+        return context.window_manager.invoke_props_dialog(self, width=500)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.label(text="Texture Preview:")
+        if context.scene.evr_preview_image:
+            img = context.scene.evr_preview_image
+            if img.preview:
+                layout.template_icon(icon_value=img.preview.icon_id, scale=10.0)
+            else:
+                layout.label(text="Preview generating...", icon='INFO')
+        else:
+            layout.label(text="No .dds preview found in cache.", icon='ERROR')
+            
+        layout.separator()
+        layout.prop(self, "texture_to_replace")
+        layout.prop(self, "replacement_dds")
+
+    def execute(self, context):
+        if not self.replacement_dds or not os.path.exists(self.replacement_dds):
+            self.report({'ERROR'}, "Please select a valid replacement DDS file.")
+            return {'CANCELLED'}
+            
+        target_hash = self.texture_to_replace
+        if target_hash == "NONE":
+            self.report({'ERROR'}, "No valid texture selected.")
+            return {'CANCELLED'}
+            
+        with open(self.replacement_dds, 'rb') as f:
+            magic = f.read(4)
+            if magic != b'DDS ':
+                self.report({'ERROR'}, "Selected file is not a valid DDS.")
+                return {'CANCELLED'}
+            f.seek(84)
+            fourcc = f.read(4)
+            header_size = 148 if fourcc == b'DX10' else 128
+            f.seek(header_size)
+            raw_data = f.read()
+            
+        from .textures import get_all_name_variations, discover_paths
+        orig_path = context.scene.evr_export_settings.original_gpu_file
+        pcvr_dir = _resolve_pcvr_dir(context, orig_path)
+            
+        if not pcvr_dir or not os.path.exists(pcvr_dir):
+            self.report({'ERROR'}, "Cannot determine PCVR dir from Original GPU File path.")
+            return {'CANCELLED'}
+            
+        global_mapping = _get_global_texture_mapping()
+        payload_hash = global_mapping.get(target_hash, target_hash)
+
+        # Find original texture size by checking all subfolders in pcvr_dir (textures can be in ae49fad43254367a, 4a4c32c49300b8a0, etc.)
+        original_size = -1
+        try:
+            for sub in os.listdir(pcvr_dir):
+                sub_path = os.path.join(pcvr_dir, sub)
+                if not os.path.isdir(sub_path): continue
+                for v in get_all_name_variations(payload_hash):
+                    p = os.path.join(sub_path, v)
+                    if os.path.exists(p):
+                        original_size = os.path.getsize(p)
+                        break
+                if original_size != -1: break
+        except Exception:
+            pass
+        
+        if original_size == -1:
+            # Fallback: find .dds in user's UI settings or mesh object settings
+            user_cache = context.scene.evr_export_settings.texture_cache_dir
+            obj_cache = None
+            if hasattr(context, "active_object") and context.active_object and context.active_object.get("evr_texture_cache"):
+                obj_cache = context.active_object["evr_texture_cache"]
+                
+            t_cache = user_cache.strip() if user_cache else None
+            
+            search_dirs = []
+            if obj_cache and os.path.exists(obj_cache) and obj_cache not in search_dirs:
+                search_dirs.append(obj_cache)
+            if t_cache and os.path.exists(t_cache) and t_cache not in search_dirs:
+                search_dirs.append(t_cache)
+            for d in search_dirs:
+                for v in get_all_name_variations(target_hash):
+                    for ext in [".dds", ".png"]:
+                        p = os.path.join(d, v + ext)
+                        if os.path.exists(p):
+                            sz = os.path.getsize(p)
+                            if sz > original_size:
+                                original_size = sz - 148  # Estimate raw size minus DDS header
+
+        if original_size < 0:
+            self.report({'WARNING'}, f"Could not find original texture {target_hash} to check size. Skipping padding.")
+            original_size = len(raw_data)
+            
+        if len(raw_data) < original_size:
+            raw_data = raw_data + b'\x00' * (original_size - len(raw_data))
+        elif len(raw_data) > original_size:
+            self.report({'WARNING'}, f"New texture is larger than original! Truncating to {original_size} bytes.")
+            raw_data = raw_data[:original_size]
+            
+        # Write to the pcvr-extracted texture folder where the game reads it from
+        # This ensures the in-game model actually sees the replaced texture
+        export_dir = context.scene.evr_export_settings.export_dir
+        pcvr_dir = _resolve_pcvr_dir(context, orig_path)
+        
+        # Strategy 1: Write directly to pcvr_extracted texture folder (for in-place replacement)
+        written = False
+        if pcvr_dir and os.path.exists(pcvr_dir):
+            for sub in os.listdir(pcvr_dir):
+                sub_path = os.path.join(pcvr_dir, sub)
+                if not os.path.isdir(sub_path): continue
+                for v in get_all_name_variations(payload_hash):
+                    p = os.path.join(sub_path, v)
+                    if os.path.exists(p):
+                        # Found original texture location — overwrite it in-place
+                        with open(p, 'wb') as f:
+                            f.write(raw_data)
+                        self.report({'INFO'}, f"Replaced texture written IN-PLACE to {p} ({len(raw_data)} bytes).")
+                        written = True
+                        break
+                if written: break
+        
+        # Strategy 2: Also write to export_dir (for mod distribution)
+        if export_dir:
+            out_dir = os.path.join(export_dir, "ae49fad43254367a")
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(out_dir, payload_hash)
+            with open(out_path, 'wb') as f:
+                f.write(raw_data)
+            self.report({'INFO'}, f"Also saved to export dir: {out_path}" if written else f"Texture saved to export dir: {out_path} ({len(raw_data)} bytes).")
+        elif not written:
+            self.report({'ERROR'}, "Could not find original texture location to overwrite, and no Export Directory set.")
+            return {'CANCELLED'}
+            
+        return {'FINISHED'}
+
+
 def register():
     bpy.utils.register_class(EVR_OT_ImportMesh)
     bpy.utils.register_class(EVR_ExportSettings)
     bpy.utils.register_class(EVR_OT_TransferWeights)
     bpy.utils.register_class(EVR_PT_ExportPanel)
     bpy.utils.register_class(EVR_OT_ExportMesh)
+    bpy.utils.register_class(EVR_OT_ReplaceTextures)
+    bpy.utils.register_class(EVR_OT_DumpModelData)
     bpy.types.Scene.evr_export_settings = bpy.props.PointerProperty(type=EVR_ExportSettings)
+    bpy.types.Scene.evr_preview_image = bpy.props.PointerProperty(type=bpy.types.Image)
+    bpy.utils.register_class(EVR_AssetSwapperSettings)
+    bpy.utils.register_class(EVR_OT_SwapAssets)
+    bpy.utils.register_class(EVR_PT_AssetSwapperPanel)
+    bpy.types.Scene.evr_swapper_settings = bpy.props.PointerProperty(type=EVR_AssetSwapperSettings)
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
     bpy.types.TOPBAR_MT_file_export.append(menu_func_export)
 
@@ -530,9 +1382,16 @@ def unregister():
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
     bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)
     del bpy.types.Scene.evr_export_settings
+    del bpy.types.Scene.evr_preview_image
     bpy.utils.unregister_class(EVR_OT_ExportMesh)
+    bpy.utils.unregister_class(EVR_OT_ReplaceTextures)
+    bpy.utils.unregister_class(EVR_OT_DumpModelData)
     bpy.utils.unregister_class(EVR_OT_TransferWeights)
     bpy.utils.unregister_class(EVR_PT_ExportPanel)
+    del bpy.types.Scene.evr_swapper_settings
+    bpy.utils.unregister_class(EVR_PT_AssetSwapperPanel)
+    bpy.utils.unregister_class(EVR_OT_SwapAssets)
+    bpy.utils.unregister_class(EVR_AssetSwapperSettings)
     bpy.utils.unregister_class(EVR_ExportSettings)
     bpy.utils.unregister_class(EVR_OT_ImportMesh)
 

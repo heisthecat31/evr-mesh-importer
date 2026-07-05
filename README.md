@@ -37,7 +37,11 @@ In the file browser, select multiple files (Shift-click or Ctrl-click) before cl
 
 ### Exporting custom meshes (Bypassing File Size Limits)
 
-Go to **File > Export > EVR Raw Mesh** and select the original GPU file you want to overwrite. For the most reliable export (especially for props and chassis models), ensure the **Encode Mode** is set to **Primary Described (Full Replace)** and point it to the matching original Primary metadata file.
+Go to **File > Export > EVR Raw Mesh** and select the original GPU file you want to overwrite. 
+
+> **Tip:** You can also export directly from the 3D Viewport by pressing **N** to open the sidebar and selecting the **EVR Mesh Exporter** tab.
+
+For the most reliable export (especially for props and chassis models), ensure the **Encode Mode** is set to **Primary Described (Full Replace)** and point it to the matching original Primary metadata file.
 
 **Massive Breakthrough:** The exporter now fully reverse-engineers and patches the `0x0B` rendering descriptors, Stream Records, and Index Records inside the Primary file. This explicitly tells the RAD Engine to dynamically allocate new memory for your custom mesh. **You are no longer constrained by the original GPU file's size!** You can safely overwrite a 180 KB original file with a 1 MB+ high-poly custom mesh, and it will load flawlessly in-game (up to the engine's hard limit of 65,535 vertices per submesh).
 
