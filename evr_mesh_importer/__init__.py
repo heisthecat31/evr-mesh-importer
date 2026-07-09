@@ -7,7 +7,7 @@ https://github.com/Dualgame/evr-mesh-importer
 bl_info = {
     "name": "EVR Raw Mesh Importer",
     "author": "Dualgame",
-    "version": (1, 3, 0),
+    "version": (2, 0, 0),
     "blender": (3, 0, 0),
     "location": "File > Import/Export > EVR Raw Mesh",
     "description": "Import/export raw GPU mesh binaries from Echo VR (Echo Arena)",
@@ -22,7 +22,7 @@ import sys
 import importlib
 import shutil
 
-_submodules = ["decode", "primary", "encode", "textures", "collision_decode"]
+_submodules = ["decode", "primary", "encode", "textures", "collision_decode", "texture_replace"]
 for _sub in _submodules:
     _full_name = f"{__package__}.{_sub}" if __package__ else _sub
     if _full_name in sys.modules:
@@ -40,8 +40,6 @@ from .encode import (
     encode_heuristic_dual28,
     encode_cgml,
     mesh_from_blender_object,
-    EncodeSizeError,
-    VertexLimitError,
 )
 from .textures import apply_textures_to_objects
 
@@ -90,8 +88,7 @@ class EVR_OT_ImportMesh(Operator, ImportHelper):
     primary_file: StringProperty(name="Primary File", default="", subtype='FILE_PATH')
     auto_find_primary: BoolProperty(name="Auto-find Primary", default=True)
     auto_apply_textures: BoolProperty(name="Auto-Apply Textures", default=True)
-    pcvr_extracted_dir: StringProperty(name="pcvr-extracted Folder", default="", subtype='DIR_PATH')
-    texture_cache_dir: StringProperty(name="Texture Cache Folder", default="", subtype='DIR_PATH')
+    extracted_game_dir: StringProperty(name="Extracted Game Dir", default="", subtype='DIR_PATH')
     flip_texture_v: BoolProperty(name="Flip Texture V", default=True)
     import_lod0_only: BoolProperty(name="Import LOD0 Only", default=True)
     import_collision: BoolProperty(name="Import Collision Data (Experimental)", default=False)
@@ -225,10 +222,8 @@ class EVR_OT_ImportMesh(Operator, ImportHelper):
                     
             obj["evr_material_index"] = idx
             # Store import paths on each mesh so texture replacement can find them later
-            if self.pcvr_extracted_dir.strip():
-                obj["evr_pcvr_extracted"] = bpy.path.abspath(self.pcvr_extracted_dir)
-            if self.texture_cache_dir.strip():
-                obj["evr_texture_cache"] = bpy.path.abspath(self.texture_cache_dir)
+            if self.extracted_game_dir.strip():
+                obj["evr_extracted_game_dir"] = bpy.path.abspath(self.extracted_game_dir)
             obj["evr_gpu_path"] = gpu_path
             if parent_empty: obj.parent = parent_empty
             created.append(obj)
@@ -370,16 +365,14 @@ class EVR_ExportSettings(bpy.types.PropertyGroup):
         subtype='DIR_PATH',
         default=r"C:\Echovr\input-pcvr"
     )
-    pcvr_extracted_dir: StringProperty(
-        name="PCVR Extracted Folder",
-        description="Path to your pcvr-extracted directory containing model mappings",
+    extracted_game_dir: StringProperty(
+        name="Extracted Game Dir",
+        description="Path to your pcvr-extracted directory containing model mappings and textures",
         subtype='DIR_PATH',
     )
-    texture_cache_dir: StringProperty(
-        name="Preview Cache Dir",
-        description="Folder containing .dds files to show as previews for texture replacement",
-        subtype='DIR_PATH',
-    )
+    replace_textures: BoolProperty(name="Replace Textures", default=True)
+    export_textures: BoolProperty(name="Export Associated Textures", default=True)
+    export_bones: BoolProperty(name="Export Bone Data", default=True)
     encode_mode: EnumProperty(
         name="Encode Mode",
         items=[
@@ -471,7 +464,7 @@ class EVR_OT_TransferWeights(bpy.types.Operator):
         return {'FINISHED'}
 
 class EVR_PT_ExportPanel(bpy.types.Panel):
-    bl_label = "EVR Mesh Exporter"
+    bl_label = "EVR Mesh Tools"
     bl_idname = "EVR_PT_export_panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -485,28 +478,267 @@ class EVR_PT_ExportPanel(bpy.types.Panel):
         layout = self.layout
         settings = context.scene.evr_export_settings
 
+        layout.label(text="Project Settings:")
         layout.prop(settings, "original_gpu_file")
-        layout.prop(settings, "export_dir")
-        layout.prop(settings, "pcvr_extracted_dir")
-        layout.prop(settings, "texture_cache_dir")
+        layout.prop(settings, "extracted_game_dir")
         layout.separator()
+        
+        layout.label(text="Import Custom Model (Replace):")
+        layout.prop(settings, "auto_decimate")
+        layout.prop(settings, "replace_textures")
+        layout.operator("export_mesh.evr_import_replace", text="Import & Replace", icon='IMPORT')
+        layout.separator()
+
+        layout.label(text="Export Options:")
+        layout.prop(settings, "export_dir")
         layout.prop(settings, "encode_mode")
         if settings.encode_mode == 'primary_described':
             layout.prop(settings, "write_primary")
             layout.prop(settings, "stream0_stride")
         layout.prop(settings, "compute_normals")
-        layout.prop(settings, "auto_decimate")
-
+        layout.prop(settings, "export_textures")
+        layout.prop(settings, "export_bones")
         layout.prop(settings, "scale")
         layout.separator()
+        
         layout.label(text="Utilities:")
         row = layout.row()
         row.operator("evr.transfer_weights", text="Transfer Weights", icon='MOD_DATA_TRANSFER')
         layout.separator()
-        layout.separator()
-        layout.operator("export_mesh.evr_raw", text="Export Mesh (Replace)", icon='EXPORT')
-        layout.operator("export_mesh.evr_replace_textures", text="Replace Textures for this Model", icon='TEXTURE')
+        layout.operator("export_mesh.evr_raw", text="Export EVR Mesh (Replace)", icon='EXPORT')
+        layout.operator("export_mesh.evr_replace_textures", text="Replace Textures Manually", icon='TEXTURE')
         layout.operator("evr.dump_model_data", text="Dump Textures & .blend", icon='PACKAGE')
+
+
+class EVR_OT_ImportAndReplace(Operator):
+    bl_idname = "export_mesh.evr_import_replace"
+    bl_label = "Import & Replace"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object and context.active_object.type == 'MESH'
+
+    def execute(self, context):
+        obj = context.active_object
+        settings = context.scene.evr_export_settings
+        
+        orig_gpu_path = bpy.path.abspath(settings.original_gpu_file)
+        if not orig_gpu_path or not os.path.isfile(orig_gpu_path):
+            self.report({'ERROR'}, "Please select the Original GPU File to replace.")
+            return {'CANCELLED'}
+            
+        ext_dir = bpy.path.abspath(settings.extracted_game_dir)
+        if not ext_dir or not os.path.isdir(ext_dir):
+            self.report({'ERROR'}, "Please set the Extracted Game Dir in Project Settings.")
+            return {'CANCELLED'}
+            
+        export_dir = bpy.path.abspath(settings.export_dir)
+        if not export_dir:
+            self.report({'ERROR'}, "Please set Export Directory.")
+            return {'CANCELLED'}
+            
+        model_hash = os.path.splitext(os.path.basename(orig_gpu_path))[0]
+        
+        # 1. Texture Replacement
+        if settings.replace_textures:
+            from .texture_replace import TextureReplacer
+            from .texture_replace import FOLDER_TEXTURE_HIGH, FOLDER_TEXTURE_LOW, FOLDER_TEXTURE_MID, parse_dds_header, build_texture_descriptor, rewrite_model_texture_mapping
+            
+            replacer = TextureReplacer(ext_dir, export_dir)
+            
+            # Get all submeshes for this model to find all materials
+            export_objs = [obj]
+            if obj.parent and obj.parent.type == 'EMPTY':
+                export_objs = [c for c in obj.parent.children if c.type == 'MESH']
+            elif len(context.selected_objects) > 1:
+                export_objs = [o for o in context.selected_objects if o.type == 'MESH']
+
+            # Extract image paths from all active object materials
+            images_by_material = {}
+            for eo in export_objs:
+                for slot_mat in eo.material_slots:
+                    mat = slot_mat.material
+                    if mat and mat.use_nodes:
+                        images_by_role = {}
+                        for node in mat.node_tree.nodes:
+                            if node.type == 'TEX_IMAGE' and node.image:
+                                img = node.image
+                                img_path = bpy.path.abspath(img.filepath) if getattr(img, 'filepath', None) else ""
+                            
+                                # If image is packed from a GLB or doesn't exist on disk, save it to temp!
+                                if img.packed_file or not os.path.isfile(img_path):
+                                    import tempfile
+                                    temp_img_path = os.path.join(tempfile.gettempdir(), f"evr_temp_{hash(img.name)}.png")
+                                    # Save to temp file safely
+                                    orig_fp = img.filepath_raw
+                                    try:
+                                        img.filepath_raw = temp_img_path
+                                        img.save()
+                                        img_path = temp_img_path
+                                    except Exception:
+                                        # Fallback to save_render
+                                        try:
+                                            img.save_render(temp_img_path)
+                                            img_path = temp_img_path
+                                        except Exception:
+                                            pass
+                                    finally:
+                                        img.filepath_raw = orig_fp
+                                    
+                                if img_path and os.path.isfile(img_path):
+                                    def get_node_role(current_node, visited=None):
+                                        if visited is None: visited = set()
+                                        if current_node in visited: return "unknown"
+                                        visited.add(current_node)
+                                    
+                                        for out in current_node.outputs:
+                                            for link in out.links:
+                                                to_node = link.to_node
+                                                if to_node.type == 'BSDF_PRINCIPLED':
+                                                    socket_name = link.to_socket.name
+                                                    if socket_name in ('Base Color', 'Color'): return 'base_color'
+                                                    if socket_name in ('Normal', 'Normal Map'): return 'normal'
+                                                    if socket_name in ('Roughness', 'Metallic', 'Specular'): return 'orm'
+                                                    if socket_name in ('Emission Color', 'Emission', 'Emission Strength'): return 'emissive'
+                                                elif to_node.type == 'NORMAL_MAP':
+                                                    return 'normal'
+                                                elif to_node.type in ('SEPARATE_COLOR', 'SEPARATE_RGB'):
+                                                    return 'orm'
+                                                else:
+                                                    r = get_node_role(to_node, visited)
+                                                    if r != "unknown": return r
+                                        return "unknown"
+                                    
+                                    role = get_node_role(node)
+                                    if role != "unknown" and role not in images_by_role:
+                                        images_by_role[role] = img_path
+                    if images_by_role:
+                        images_by_material[mat.name] = images_by_role
+
+            if not images_by_material:
+                self.report({'WARNING'}, "No texture images found on the selected model's materials.")
+            else:
+                replaced_count = 0
+                from .texture_replace import TextureSlot
+                dynamic_slots = []
+                
+                # Create dynamic slots based on ALL textures assigned across ALL materials
+                for mat_name, roles in images_by_material.items():
+                    for role, img_path in roles.items():
+                        base_name = os.path.splitext(os.path.basename(img_path))[0]
+                        import hashlib
+                        
+                        if len(base_name) == 16 and all(c in '0123456789abcdefABCDEF' for c in base_name):
+                            metadata_hash = base_name.lower()
+                            payload_hash = replacer._resolve_payload_hash(metadata_hash) or hashlib.md5((metadata_hash+"_payload").encode()).hexdigest()[:16]
+                        else:
+                            metadata_hash = hashlib.md5(base_name.encode()).hexdigest()[:16]
+                            payload_hash = hashlib.md5((base_name+"_payload").encode()).hexdigest()[:16]
+
+                        slot = TextureSlot(
+                            metadata_hash=metadata_hash,
+                            payload_hash=payload_hash,
+                            slot_index=list(roles.keys()).index(role),
+                            skin_id=0,
+                        )
+                        slot.low_path = replacer._find_texture_file(metadata_hash, FOLDER_TEXTURE_LOW)
+                        slot.mid_path = replacer._find_texture_file(metadata_hash, FOLDER_TEXTURE_MID)
+                        slot.high_path = replacer._find_texture_file(payload_hash, FOLDER_TEXTURE_HIGH)
+
+                        dynamic_slots.append((slot, img_path))
+                
+                for slot, img_path in dynamic_slots:
+                    self.report({'INFO'}, f"Replacing dynamically found texture {slot.metadata_hash}...")
+                    res = replacer.replace_texture(slot, img_path)
+                    if res.get("errors"):
+                        for err in res["errors"]:
+                            self.report({'ERROR'}, f"Texture error: {err}")
+                    if res.get("high_written") or res.get("low_written"):
+                        replaced_count += 1
+                
+                # BLANKET REPLACE LOGIC:
+                # The user wants to override ALL original textures of the model with the new custom textures.
+                if dynamic_slots:
+                    first_custom_slot = dynamic_slots[0][0]
+                    first_custom_hash = first_custom_slot.metadata_hash
+                    
+                    # Read the custom texture's MID DDS data
+                    custom_mid_path = os.path.join(export_dir, FOLDER_TEXTURE_MID, first_custom_hash)
+                    if os.path.exists(custom_mid_path):
+                        with open(custom_mid_path, 'rb') as f:
+                            custom_dds_data_original = f.read()
+                        
+                        original_slots = replacer.find_model_textures(model_hash)
+                        dynamic_meta_hashes = {s[0].metadata_hash for s in dynamic_slots}
+                        blanket_count = 0
+                            
+                        if original_slots:
+                            for o_slot in original_slots:
+                                if o_slot.metadata_hash in dynamic_meta_hashes:
+                                    continue  # Already replaced
+                                    
+                                # Read original DXGI format to prevent shiny/smoothed out artifacts
+                                orig_dxgi = 0
+                                orig_low_path = replacer._find_texture_file(o_slot.metadata_hash, "BCE9C410B354B078")
+                                if not orig_low_path:
+                                    orig_low_path = replacer._find_texture_file(o_slot.metadata_hash, FOLDER_TEXTURE_LOW)
+                                
+                                if orig_low_path and os.path.exists(orig_low_path):
+                                    with open(orig_low_path, 'rb') as f:
+                                        orig_data = f.read(256)
+                                    if len(orig_data) >= 256:
+                                        orig_dxgi = struct.unpack_from('<I', orig_data, 192+24)[0]
+
+                                if orig_dxgi == 83: # BC5_UNORM (Normal Map)
+                                    custom_dds_data = bytes.fromhex('444453207c00000007100a000400000004000000100000000100000001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000020000000040000004458313000000000000000000000000000000000000000000010000000000000000000000000000000000000530000000300000000000000010000000000000080800000000000008080000000000000') # 4x4 BC5
+                                    synthetic_desc = build_texture_descriptor(4, 4, 1, 83, len(custom_dds_data), srgb=0)
+                                elif orig_dxgi in (71, 98, 77, 95): # BC1/BC7 UNORM (ARM / Roughness / Emissive)
+                                    custom_dds_data = bytes.fromhex('444453207c00000007100a0004000000040000000800000001000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000200000000400000044583130000000000000000000000000000000000000000000100000000000000000000000000000000000004700000003000000000000000100000000000000ffffffff00000000') # 4x4 BC1
+                                    synthetic_desc = build_texture_descriptor(4, 4, 1, 71, len(custom_dds_data), srgb=0)
+                                else: # SRGB formats (Albedo) or Unknown
+                                    w, h, mips, dxgi = parse_dds_header(custom_dds_data_original)
+                                    if w == 0:
+                                        self.report({'WARNING'}, f"Failed to parse custom DDS for blanket replace.")
+                                        continue
+                                    synthetic_desc = build_texture_descriptor(w, h, mips, dxgi, len(custom_dds_data_original), srgb=1)
+                                    custom_dds_data = custom_dds_data_original
+
+                                # 3. Clean up old HIGH bucket file if it exists, since synthetic descriptors don't use it
+                                out_high_dir = os.path.join(export_dir, FOLDER_TEXTURE_HIGH)
+                                out_high_path = os.path.join(out_high_dir, o_slot.payload_hash)
+                                if os.path.exists(out_high_path):
+                                    try: os.remove(out_high_path)
+                                    except: pass
+
+                                # 4. Overwrite LOW file with synthetic descriptor
+                                out_low_dir = os.path.join(export_dir, FOLDER_TEXTURE_LOW)
+                                os.makedirs(out_low_dir, exist_ok=True)
+                                out_low_path = os.path.join(out_low_dir, o_slot.metadata_hash)
+                                try:
+                                    with open(out_low_path, 'wb') as f:
+                                        f.write(synthetic_desc)
+                                except Exception as e:
+                                    self.report({'WARNING'}, f"Failed to write LOW descriptor for {o_slot.metadata_hash}: {e}")
+
+                                # 5. Overwrite MID file with full raw DDS
+                                out_mid_dir = os.path.join(export_dir, FOLDER_TEXTURE_MID)
+                                os.makedirs(out_mid_dir, exist_ok=True)
+                                out_mid_path = os.path.join(out_mid_dir, o_slot.metadata_hash)
+                                try:
+                                    with open(out_mid_path, 'wb') as f:
+                                        f.write(custom_dds_data)
+                                    blanket_count += 1
+                                except Exception as e:
+                                    self.report({'WARNING'}, f"Failed to write MID DDS for {o_slot.metadata_hash}: {e}")
+
+                            self.report({'INFO'}, f"Replaced {replaced_count} assigned textures, and blanket-patched {blanket_count} original textures to point to the custom texture!")
+                else:
+                    self.report({'INFO'}, f"Replaced {replaced_count} textures dynamically based on Blender materials.")
+                    
+        # 2. Mesh replacement (calls export_mesh.evr_raw)
+        bpy.ops.export_mesh.evr_raw()
+        return {'FINISHED'}
 
 
 class EVR_OT_ExportMesh(Operator):
@@ -572,14 +804,16 @@ class EVR_OT_ExportMesh(Operator):
                     do_split = (len(export_objs) == 1)
                     for eo in export_objs:
                         if do_split:
-                            submeshes.extend(mesh_from_blender_object(eo, apply_transforms=True, split_by_material=True, decimate_ratio=ratio))
+                            submeshes.extend(mesh_from_blender_object(eo, apply_transforms=True, split_by_material=True))
                         else:
-                            submeshes.append(mesh_from_blender_object(eo, apply_transforms=True, split_by_material=False, decimate_ratio=ratio))
+                            submeshes.append(mesh_from_blender_object(eo, apply_transforms=True, split_by_material=False))
                 else:
-                    res = mesh_from_blender_object(obj, apply_transforms=True, split_by_material=False, decimate_ratio=ratio)
+                    res = mesh_from_blender_object(obj, apply_transforms=True, split_by_material=False)
                     verts, faces, uvs = res[0], res[1], res[2]
                     bone_data = res[3] if len(res) > 3 else None
-                    colors = res[4] if len(res) > 4 else None
+                    normals = res[4] if len(res) > 4 else None
+                    tangents = res[5] if len(res) > 5 else None
+                    colors = res[6] if len(res) > 6 else None
 
                 if settings.scale != 1.0:
                     s = settings.scale
@@ -592,10 +826,10 @@ class EVR_OT_ExportMesh(Operator):
                 os.makedirs(out_gpu_dir, exist_ok=True)
 
                 if settings.encode_mode == 'heuristic_s16':
-                    self._write_gpu(out_gpu_path, encode_heuristic_s16(verts, faces, uvs=uvs, bone_data=bone_data, colors=colors, compute_normals=cn))
+                    self._write_gpu(out_gpu_path, encode_heuristic_s16(verts, faces, uvs=uvs, bone_data=bone_data, compute_normals=cn))
                     self.report({'INFO'}, f"Saved GPU to {out_gpu_path}")
                 elif settings.encode_mode == 'heuristic_s20':
-                    self._write_gpu(out_gpu_path, encode_heuristic_s20(verts, faces, uvs=uvs, bone_data=bone_data, colors=colors, compute_normals=cn))
+                    self._write_gpu(out_gpu_path, encode_heuristic_s20(verts, faces, uvs=uvs, bone_data=bone_data, compute_normals=cn))
                     self.report({'INFO'}, f"Saved GPU to {out_gpu_path}")
                 elif settings.encode_mode == 'heuristic_dual28':
                     self._write_gpu(out_gpu_path, encode_heuristic_dual28(verts, faces, bone_data=bone_data, compute_normals=cn))
@@ -620,7 +854,7 @@ class EVR_OT_ExportMesh(Operator):
                         else:
                             from .encode import encode_primary_described_full_replace
                             gpu_data, primary_data = encode_primary_described_full_replace(
-                                orig_gpu, orig_primary, verts, faces, uvs=uvs, bone_data=bone_data, colors=colors, stream0_stride=s0_stride, compute_normals=cn
+                                orig_gpu, orig_primary, verts, faces, uvs=uvs, bone_data=bone_data, normals=normals, tangents=tangents, stream0_stride=s0_stride, compute_normals=cn
                             )
 
                         self._write_gpu(out_gpu_path, gpu_data)
@@ -633,6 +867,19 @@ class EVR_OT_ExportMesh(Operator):
                     else:
                         self.report({'ERROR'}, f"Could not find original Primary file for {orig_gpu_path}")
                         return {'CANCELLED'}
+                        
+                if settings.export_textures:
+                    ext_dir = bpy.path.abspath(settings.extracted_game_dir)
+                    if ext_dir and os.path.isdir(ext_dir):
+                        from .texture_replace import TextureReplacer
+                        replacer = TextureReplacer(ext_dir, export_dir)
+                        written_tex = replacer.export_model_textures(hash_name, overwrite=False)
+                        if written_tex:
+                            self.report({'INFO'}, f"Exported {len(written_tex)} associated textures.")
+                        else:
+                            self.report({'INFO'}, "No associated textures found to export.")
+                    else:
+                        self.report({'WARNING'}, "Cannot export textures: Extracted Game Dir not set or invalid.")
                         
                 break # Successfully saved, exit retry loop
 
@@ -808,29 +1055,114 @@ class EVR_OT_DumpModelData(Operator):
                         for node in mat_slot.material.node_tree.nodes:
                             if node.type == 'TEX_IMAGE' and node.image:
                                 img = node.image
-                                if img.filepath and img.name not in copied_images:
-                                    src = bpy.path.abspath(img.filepath)
-                                    if os.path.exists(src):
-                                        basename = os.path.basename(src)
-                                        dst = os.path.join(dump_dir, basename)
-                                        try:
+                                if img.name not in copied_images:
+                                    tex_dir = os.path.join(dump_dir, "textures")
+                                    os.makedirs(tex_dir, exist_ok=True)
+                                    
+                                    # Clean up the name to ensure it has a valid extension
+                                    basename = img.name
+                                    if not basename.lower().endswith(('.png', '.jpg', '.jpeg', '.tga')):
+                                        basename += '.png'
+                                        
+                                    dst = os.path.join(tex_dir, basename)
+                                    src = bpy.path.abspath(img.filepath) if getattr(img, 'filepath', None) else ""
+                                    
+                                    try:
+                                        if img.packed_file or not os.path.exists(src):
+                                            # Image is packed or doesn't exist on disk, save it from memory
+                                            old_fp = img.filepath_raw
+                                            img.filepath_raw = dst
+                                            if dst.lower().endswith('.png'): img.file_format = 'PNG'
+                                            img.save()
+                                            img.filepath_raw = old_fp
+                                            copied_images[img.name] = dst
+                                        else:
+                                            # Exists on disk, just copy it directly
                                             import shutil
                                             shutil.copy2(src, dst)
                                             copied_images[img.name] = dst
-                                        except Exception as e:
-                                            print(f"Failed to copy texture: {e}")
+                                    except Exception as e:
+                                        print(f"Failed to copy texture: {e}")
+
+        # Fallback: if no textures were found in Blender's material nodes, dump the raw game textures directly
+        if not copied_images:
+            model_hash = root.name.split('_')[0]
+            
+            possible_ext_dirs = []
+            if hasattr(context.scene, "evr_swapper_settings") and getattr(context.scene.evr_swapper_settings, "pcvr_extracted_dir", ""):
+                possible_ext_dirs.append(context.scene.evr_swapper_settings.pcvr_extracted_dir)
+            if getattr(context.scene.evr_export_settings, "extracted_game_dir", ""):
+                possible_ext_dirs.append(context.scene.evr_export_settings.extracted_game_dir)
+            
+            from .textures import discover_paths
+            disc = discover_paths()
+            if disc.get("pcvr_extracted"):
+                possible_ext_dirs.append(disc.get("pcvr_extracted"))
+                
+            mapping = None
+            ext_dir = ""
+            for pd in possible_ext_dirs:
+                if pd and os.path.exists(pd):
+                    try:
+                        from .textures import parse_materials_mapping
+                        m = parse_materials_mapping(pd, model_hash)
+                        if m and "textures" in m:
+                            mapping = m
+                            ext_dir = pd
+                            break
+                    except: pass
+            
+            if mapping:
+                tex_dir = os.path.join(dump_dir, "textures")
+                os.makedirs(tex_dir, exist_ok=True)
+                import shutil
+                import tempfile
+                
+                texconv_path = os.path.join(os.path.dirname(__file__), "bin", "texconv.exe")
+                from .texture_decoder import decode_texture
+                
+                fallback_errors = []
+                
+                for tex_hash in set(mapping["textures"]):
+                    # Generate a temporary PNG path
+                    temp_png = os.path.join(tempfile.gettempdir(), f"dump_{tex_hash}.png")
+                    dst = os.path.join(tex_dir, f"{tex_hash}.png")
+                    
+                    # Use decode_texture to compile high/low and convert to PNG
+                    if os.path.exists(texconv_path):
+                        success = decode_texture(tex_hash, ext_dir, temp_png, texconv_path)
+                        if success and os.path.exists(temp_png):
+                            try:
+                                shutil.copy2(temp_png, dst)
+                                copied_images[tex_hash] = dst
+                                os.remove(temp_png)
+                            except Exception as e:
+                                fallback_errors.append(f"Copy {tex_hash}: {e}")
+                        else:
+                            fallback_errors.append(f"Decode failed {tex_hash}")
+                    else:
+                        fallback_errors.append("texconv.exe missing")
+                        break
+                        
+                if not copied_images and fallback_errors:
+                    self.report({'WARNING'}, f"Found mapping, but decoding failed: {fallback_errors[0]}")
+            else:
+                self.report({'WARNING'}, f"Could not find materials mapping for {model_hash} in any extraction folder!")
 
         original_paths = {}
         for img_name, dst in copied_images.items():
             img = bpy.data.images.get(img_name)
             if img:
                 original_paths[img.name] = img.filepath
-                img.filepath = "//" + os.path.basename(dst)
+                img.filepath = "//textures/" + os.path.basename(dst)
                 
         blend_path = os.path.join(dump_dir, f"{root.name}_dump.blend")
         try:
-            bpy.data.libraries.write(blend_path, set(objs_to_export), fake_user=True)
-            self.report({'INFO'}, f"Dumped to {dump_dir}")
+            bpy.ops.wm.save_as_mainfile(filepath=blend_path, copy=True)
+            if len(copied_images) > 0:
+                self.report({'INFO'}, f"Dumped to {dump_dir} with {len(copied_images)} textures")
+            else:
+                self.report({'WARNING'}, f"Dumped to {dump_dir} BUT NO TEXTURES WERE FOUND ON THE MESH!")
         except Exception as e:
             self.report({'ERROR'}, f"Failed to dump blend: {e}")
             
@@ -1366,6 +1698,7 @@ def register():
     bpy.utils.register_class(EVR_ExportSettings)
     bpy.utils.register_class(EVR_OT_TransferWeights)
     bpy.utils.register_class(EVR_PT_ExportPanel)
+    bpy.utils.register_class(EVR_OT_ImportAndReplace)
     bpy.utils.register_class(EVR_OT_ExportMesh)
     bpy.utils.register_class(EVR_OT_ReplaceTextures)
     bpy.utils.register_class(EVR_OT_DumpModelData)
@@ -1383,6 +1716,7 @@ def unregister():
     bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)
     del bpy.types.Scene.evr_export_settings
     del bpy.types.Scene.evr_preview_image
+    bpy.utils.unregister_class(EVR_OT_ImportAndReplace)
     bpy.utils.unregister_class(EVR_OT_ExportMesh)
     bpy.utils.unregister_class(EVR_OT_ReplaceTextures)
     bpy.utils.unregister_class(EVR_OT_DumpModelData)

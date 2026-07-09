@@ -25,7 +25,7 @@ out_dir.mkdir(exist_ok=True)
 out = out_dir / f"evr_mesh_importer_v{version}.zip"
 
 with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-    for ext in ("*.py", "*.json"):
+    for ext in ("*.py", "*.json", "bin/texconv.exe", "bin/*.dll"):
         for f in sorted(src.rglob(ext)):
             zf.write(f)
 

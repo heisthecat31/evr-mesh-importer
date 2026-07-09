@@ -8,26 +8,8 @@ import math
 
 
 # ============================================================
-# Math & Validation helpers
+# Math helpers
 # ============================================================
-
-class EncodeSizeError(ValueError):
-    def __init__(self, new_size, orig_size):
-        self.new_size = new_size
-        self.orig_size = orig_size
-        super().__init__(f"Encode failed: The new mesh is too large! It resulted in a {new_size} byte file, but the original file was only {orig_size} bytes.")
-
-class VertexLimitError(ValueError):
-    def __init__(self, current_verts, max_verts=65535, mesh_name="Mesh"):
-        self.current_verts = current_verts
-        self.max_verts = max_verts
-        super().__init__(f"Mesh '{mesh_name}' has {current_verts} vertices. Decimate below {max_verts} before exporting.")
-
-def _validate_mesh(verts, faces, name="Mesh", allow_degenerate=False):
-    if len(verts) > 65535:
-        raise ValueError(f"Encode failed ({name}): Vertex count {len(verts)} exceeds the 65535 maximum limit for 16-bit indices.")
-    if len(verts) == 0 and not allow_degenerate:
-        raise ValueError(f"Encode failed ({name}): Mesh has 0 vertices.")
 
 def _normalize(v):
     x, y, z = v
@@ -97,20 +79,16 @@ def _make_tangent_frame(normal):
 # Stream packers
 # ============================================================
 
-def _pack_stream0_s16(vertex_count, uvs=None, bone_data=None, colors=None):
+def _pack_stream0_s16(vertex_count, uvs=None, bone_data=None):
     out = bytearray()
     for i in range(vertex_count):
         u, v = uvs[i] if uvs else (0.0, 0.0)
         
-        if bone_data and i < len(bone_data) and sum(bone_data[i][1]) > 0:
+        if bone_data and i < len(bone_data):
             indices, weights = bone_data[i]
             b0, b1, b2, b3 = weights
             word0 = (b3 << 24) | (b2 << 16) | (b1 << 8) | b0
             word1 = 0x00000000
-        elif colors and i < len(colors):
-            c0, c1 = colors[i]
-            word0 = (int(c0[3]*255+0.5) << 24) | (int(c0[2]*255+0.5) << 16) | (int(c0[1]*255+0.5) << 8) | int(c0[0]*255+0.5)
-            word1 = (int(c1[3]*255+0.5) << 24) | (int(c1[2]*255+0.5) << 16) | (int(c1[1]*255+0.5) << 8) | int(c1[0]*255+0.5)
         else:
             word0 = 0x00000000
             word1 = 0x00000000
@@ -118,20 +96,16 @@ def _pack_stream0_s16(vertex_count, uvs=None, bone_data=None, colors=None):
         out += struct.pack('<IIff', word0, word1, u, v)
     return bytes(out)
 
-def _pack_stream0_s20_white(vertex_count, uvs=None, bone_data=None, colors=None):
+def _pack_stream0_s20_white(vertex_count, uvs=None, bone_data=None):
     out = bytearray()
     for i in range(vertex_count):
         u, v = uvs[i] if uvs else (0.0, 0.0)
         
-        if bone_data and i < len(bone_data) and sum(bone_data[i][1]) > 0:
+        if bone_data and i < len(bone_data):
             indices, weights = bone_data[i]
             b0, b1, b2, b3 = weights
             word0 = (b3 << 24) | (b2 << 16) | (b1 << 8) | b0
             word1 = 0x00000000
-        elif colors and i < len(colors):
-            c0, c1 = colors[i]
-            word0 = (int(c0[3]*255+0.5) << 24) | (int(c0[2]*255+0.5) << 16) | (int(c0[1]*255+0.5) << 8) | int(c0[0]*255+0.5)
-            word1 = (int(c1[3]*255+0.5) << 24) | (int(c1[2]*255+0.5) << 16) | (int(c1[1]*255+0.5) << 8) | int(c1[0]*255+0.5)
         else:
             word0 = 0x00000000
             word1 = 0x00000000
@@ -144,11 +118,11 @@ def _pack_stream0_s28_ff(vertex_count):
     record = struct.pack('<II', 0x00000000, 0x00000000) + b'\x00' * 20
     return record * vertex_count
 
-def _pack_stream0_dynamic(vertex_count, stride, uvs=None, bone_data=None, orig_word1=0xFFFF0000, orig_word0=0x00000000, orig_stream0=None, colors=None):
+def _pack_stream0_dynamic(vertex_count, stride, uvs=None, bone_data=None, orig_word1=0xFFFF0000, orig_word0=0x00000000, orig_stream0=None):
     if stride == 16:
-        return _pack_stream0_s16(vertex_count, uvs=uvs, bone_data=bone_data, colors=colors)
+        return _pack_stream0_s16(vertex_count, uvs=uvs, bone_data=bone_data)
     elif stride == 20:
-        return _pack_stream0_s20_white(vertex_count, uvs=uvs, bone_data=bone_data, colors=colors)
+        return _pack_stream0_s20_white(vertex_count, uvs=uvs, bone_data=bone_data)
 
     out = bytearray()
     for i in range(vertex_count):
@@ -158,7 +132,7 @@ def _pack_stream0_dynamic(vertex_count, stride, uvs=None, bone_data=None, orig_w
         if orig_stream0 and len(orig_stream0) >= (i+1)*stride:
             orig_record = bytearray(orig_stream0[i*stride:(i+1)*stride])
         
-        if bone_data and i < len(bone_data) and sum(bone_data[i][1]) > 0:
+        if bone_data and i < len(bone_data):
             indices, weights = bone_data[i]
             if stride < 24:
                 b0, b1, b2, b3 = weights
@@ -171,10 +145,6 @@ def _pack_stream0_dynamic(vertex_count, stride, uvs=None, bone_data=None, orig_w
             else:
                 word0 = orig_word0
                 word1 = orig_word1
-        elif colors and i < len(colors):
-            c0, c1 = colors[i]
-            word0 = (int(c0[3]*255+0.5) << 24) | (int(c0[2]*255+0.5) << 16) | (int(c0[1]*255+0.5) << 8) | int(c0[0]*255+0.5)
-            word1 = (int(c1[3]*255+0.5) << 24) | (int(c1[2]*255+0.5) << 16) | (int(c1[1]*255+0.5) << 8) | int(c1[0]*255+0.5)
         else:
             word0 = orig_word0 if stride >= 24 else 0x00000000
             word1 = orig_word1
@@ -242,7 +212,7 @@ def _pack_10_10_10_2(x, y, z, w=0):
     packed = (iw << 30) | (iz << 20) | (iy << 10) | ix
     return struct.pack('<I', packed)
 
-def _pack_stream1_with_normals(verts, normals, bone_data=None, orig_stream1=None, s1_stride=28):
+def _pack_stream1_with_normals(verts, normals, tangents=None, bone_data=None, orig_stream1=None, s1_stride=28, force_snorm16=False):
     out = bytearray()
     for i, ((x, y, z), (nx, ny, nz)) in enumerate(zip(verts, normals)):
         orig_record = None
@@ -252,37 +222,24 @@ def _pack_stream1_with_normals(verts, normals, bone_data=None, orig_stream1=None
         if orig_record:
             record = orig_record
             struct.pack_into('<fff', record, 0, x, y, z)
-            tangent, handedness = _make_tangent_frame((nx, ny, nz))
-            tx, ty, tz = tangent
-            
-            # Determine if this is a snorm16 layout or a 10_10_10_2 bone layout
-            # 10_10_10_2 bone layout uses 4 bytes for normal, 4 for tangent.
-            # We can check if bone_data is present.
-            if bone_data and i < len(bone_data):
-                n_packed = _pack_10_10_10_2(nx, ny, nz, 0)
-                t_packed = _pack_10_10_10_2(tx, ty, tz, handedness)
-                record[12:16] = n_packed
-                record[16:20] = t_packed
-                # Bone indices remain at 20:24, bone weights at 24:28
-            else:
-                n_packed = struct.pack('<hhhh', _float_to_snorm16(nx), _float_to_snorm16(ny), _float_to_snorm16(nz), 0)
-                t_packed = struct.pack('<hhhh', _float_to_snorm16(tx), _float_to_snorm16(ty), _float_to_snorm16(tz), _float_to_snorm16(handedness))
-                record[12:20] = n_packed
-                if len(record) >= 28:
-                    record[20:28] = t_packed
+            n_packed = struct.pack('<hhhh', _float_to_snorm16(nx), _float_to_snorm16(ny), _float_to_snorm16(nz), 0)
+            record[12:20] = n_packed
         else:
             record = bytearray()
             record += struct.pack('<fff', x, y, z)
             
-            tangent, handedness = _make_tangent_frame((nx, ny, nz))
-            tx, ty, tz = tangent
+            if tangents and i < len(tangents):
+                tx, ty, tz, handedness = tangents[i]
+            else:
+                tangent, handedness = _make_tangent_frame((nx, ny, nz))
+                tx, ty, tz = tangent
             
-            if bone_data and i < len(bone_data):
+            if (not force_snorm16) and bone_data and i < len(bone_data):
                 record += _pack_10_10_10_2(nx, ny, nz, 0)
                 record += _pack_10_10_10_2(tx, ty, tz, handedness)
                 indices, weights = bone_data[i]
                 record += struct.pack('<4B', *indices)
-                record += struct.pack('<4B', *weights)
+                record += _pack_10_10_10_2(0, 1, 0, 1)
             else:
                 record += struct.pack('<hhhh', _float_to_snorm16(nx), _float_to_snorm16(ny), _float_to_snorm16(nz), 0)
                 record += struct.pack('<hhhh', _float_to_snorm16(tx), _float_to_snorm16(ty), _float_to_snorm16(tz), _float_to_snorm16(handedness))
@@ -314,7 +271,7 @@ def _pack_stream1_zeroed(verts, bone_data=None, orig_stream1=None, s1_stride=28)
                 record += _pack_10_10_10_2(1, 0, 0, 1)
                 indices, weights = bone_data[i]
                 record += struct.pack('<4B', *indices)
-                record += struct.pack('<4B', *weights)
+                record += _pack_10_10_10_2(0, 1, 0, 1)
             else:
                 record += struct.pack('<hhhh', 0, 0, 32767, 0)
                 record += struct.pack('<hhhh', 32767, 0, 0, 32767)
@@ -327,9 +284,9 @@ def _pack_stream1_zeroed(verts, bone_data=None, orig_stream1=None, s1_stride=28)
         out += record
     return bytes(out)
 
-def encode_heuristic_s16(verts, faces, uvs=None, bone_data=None, colors=None, compute_normals=True):
+def encode_heuristic_s16(verts, faces, uvs=None, bone_data=None, compute_normals=True):
     _validate_mesh(verts, faces, "heuristic_s16")
-    s0 = _pack_stream0_s16(len(verts), uvs=uvs, bone_data=bone_data, colors=colors)
+    s0 = _pack_stream0_s16(len(verts), uvs=uvs, bone_data=bone_data)
     if compute_normals:
         normals = _compute_smooth_normals(verts, faces)
         s1 = _pack_stream1_with_normals(verts, normals, bone_data=bone_data)
@@ -338,9 +295,9 @@ def encode_heuristic_s16(verts, faces, uvs=None, bone_data=None, colors=None, co
     ib = _pack_index_buffer_u16(faces)
     return s0 + s1 + ib
 
-def encode_heuristic_s20(verts, faces, uvs=None, bone_data=None, colors=None, compute_normals=True):
+def encode_heuristic_s20(verts, faces, uvs=None, bone_data=None, compute_normals=True):
     _validate_mesh(verts, faces, "heuristic_s20")
-    s0 = _pack_stream0_s20_white(len(verts), uvs=uvs, bone_data=bone_data, colors=colors)
+    s0 = _pack_stream0_s20_white(len(verts), uvs=uvs, bone_data=bone_data)
     if compute_normals:
         normals = _compute_smooth_normals(verts, faces)
         s1 = _pack_stream1_with_normals(verts, normals, bone_data=bone_data)
@@ -360,7 +317,7 @@ def encode_heuristic_dual28(verts, faces, bone_data=None, compute_normals=True):
     ib = _pack_index_buffer_u16(faces)
     return s0 + s1 + ib
 
-def encode_primary_described(verts, faces, uvs=None, bone_data=None, colors=None, stream0_stride=16, compute_normals=True):
+def encode_primary_described(verts, faces, uvs=None, bone_data=None, stream0_stride=16, compute_normals=True):
     _validate_mesh(verts, faces, "primary_described")
     assert stream0_stride in (16, 20), "stream0_stride must be 16 or 20"
 
@@ -368,9 +325,9 @@ def encode_primary_described(verts, faces, uvs=None, bone_data=None, colors=None
     nt = len(faces)
 
     if stream0_stride == 16:
-        s0 = _pack_stream0_s16(nv, uvs=uvs, colors=colors, bone_data=bone_data)
+        s0 = _pack_stream0_s16(nv, uvs=uvs)
     else:
-        s0 = _pack_stream0_s20_white(nv, uvs=uvs, colors=colors, bone_data=bone_data)
+        s0 = _pack_stream0_s20_white(nv, uvs=uvs)
 
     if compute_normals:
         normals = _compute_smooth_normals(verts, faces)
@@ -391,10 +348,14 @@ def encode_primary_described(verts, faces, uvs=None, bone_data=None, colors=None
 
     return gpu_data, primary_data
 
-def encode_cgml(submesh_list, compute_normals=True, enforce_size_limit=True):
+def encode_cgml(submesh_list, compute_normals=True):
     out = bytearray()
     for i, sub in enumerate(submesh_list):
-        if len(sub) == 3:
+        if len(sub) == 6:
+            verts, faces, uvs, bone_data, normals, tangents = sub
+        elif len(sub) == 4:
+            verts, faces, uvs, bone_data = sub
+        elif len(sub) == 3:
             verts, faces, uvs = sub
         else:
             verts, faces = sub
@@ -407,49 +368,40 @@ def encode_cgml(submesh_list, compute_normals=True, enforce_size_limit=True):
 # Blender mesh extraction
 # ============================================================
 
-def mesh_from_blender_object(obj, apply_transforms=True, split_by_material=False, decimate_ratio=1.0):
+def mesh_from_blender_object(obj, apply_transforms=True, split_by_material=False):
     import bpy
-    import bmesh
+    import mathutils
 
-    eval_obj = obj
-    mod_name = "EVR_AutoDecimate"
-    weld_name = "EVR_AutoWeld"
-    eval_mesh = None
-    if decimate_ratio < 1.0:
-        weld = obj.modifiers.new(name=weld_name, type='WELD')
-        weld.merge_threshold = 0.001
-        
-        mod = obj.modifiers.new(name=mod_name, type='DECIMATE')
-        mod.decimate_type = 'COLLAPSE'
-        mod.ratio = decimate_ratio
-        
-        # Evaluate to get the decimated mesh geometry
-        depsgraph = bpy.context.evaluated_depsgraph_get()
-        eval_obj = obj.evaluated_get(depsgraph)
-        eval_mesh = eval_obj.to_mesh()
-
-    bm = bmesh.new()
-    if eval_mesh:
-        bm.from_mesh(eval_mesh)
-    else:
-        bm.from_mesh(eval_obj.data)
-
-    # Clean up the modifiers from original object
-    if decimate_ratio < 1.0:
-        if mod_name in obj.modifiers:
-            obj.modifiers.remove(obj.modifiers[mod_name])
-        if weld_name in obj.modifiers:
-            obj.modifiers.remove(obj.modifiers[weld_name])
-        if eval_mesh:
-            eval_obj.to_mesh_clear()
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    eval_obj = obj.evaluated_get(depsgraph)
+    mesh = eval_obj.to_mesh()
 
     if apply_transforms:
-        bm.transform(obj.matrix_world)
+        mesh.transform(eval_obj.matrix_world)
 
+    # We must triangulate to calculate tangents correctly.
+    import bmesh
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
     bmesh.ops.triangulate(bm, faces=bm.faces[:])
-    uv_layer = bm.loops.layers.uv.active
-    color_layer0 = bm.loops.layers.color.get("word0")
-    color_layer1 = bm.loops.layers.color.get("word1")
+    bm.to_mesh(mesh)
+    bm.free()
+
+    if not mesh.uv_layers:
+        # Create a dummy UV layer if missing so calc_tangents doesn't fail
+        mesh.uv_layers.new(name="UVMap")
+
+    for poly in mesh.polygons:
+        poly.use_smooth = True
+
+    try:
+        mesh.calc_normals_split()
+    except AttributeError:
+        pass # Blender 4.1+ calculates them automatically
+        
+    mesh.calc_tangents()
+
+    uv_layer = mesh.uv_layers.active.data
 
     # Extract vertex groups for bone data
     vertex_groups = obj.vertex_groups
@@ -466,20 +418,18 @@ def mesh_from_blender_object(obj, apply_transforms=True, split_by_material=False
         if not vg_map:
             return (0,0,0,0), (0,0,0,0)
         
-        groups = obj.data.vertices[vert_index].groups
+        groups = eval_obj.data.vertices[vert_index].groups
         weights = []
         for g in groups:
             if g.group in vg_map:
                 weights.append((vg_map[g.group], g.weight))
                 
-        # Sort by weight descending, take top 4
         weights.sort(key=lambda x: x[1], reverse=True)
         weights = weights[:4]
         
         if not weights:
             return (0,0,0,0), (0,0,0,0)
             
-        # Normalize weights to 255
         total_weight = sum(w for i, w in weights)
         if total_weight <= 0:
             return (0,0,0,0), (0,0,0,0)
@@ -487,104 +437,81 @@ def mesh_from_blender_object(obj, apply_transforms=True, split_by_material=False
         norm_weights = [int(round((w / total_weight) * 255)) for i, w in weights]
         indices = [i for i, w in weights]
         
-        # Ensure it sums to exactly 255
         diff = 255 - sum(norm_weights)
         if diff != 0 and norm_weights:
             norm_weights[0] += diff
             
-        # Pad to 4
         while len(norm_weights) < 4:
             norm_weights.append(0)
             indices.append(0)
             
         return tuple(indices), tuple(norm_weights)
 
-    if not split_by_material:
-        verts = [(v.co.x, v.co.y, v.co.z) for v in bm.verts]
-        faces = [(f.verts[0].index, f.verts[1].index, f.verts[2].index)
-                 for f in bm.faces]
-        
-        uvs = []
-        bone_data = []
-        colors = []
-        if uv_layer:
-            for v in bm.verts:
-                uv = (0.0, 0.0)
-                if v.link_loops:
-                    loop = v.link_loops[0]
-                    uv = (loop[uv_layer].uv.x, loop[uv_layer].uv.y)
-                    c0 = loop[color_layer0] if color_layer0 else (0.0, 0.0, 0.0, 0.0)
-                    c1 = loop[color_layer1] if color_layer1 else (0.0, 0.0, 0.0, 0.0)
-                else:
-                    c0, c1 = (0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0)
-                uvs.append(uv)
-                colors.append((c0, c1))
-                bone_data.append(extract_bone_data(v.index))
-        else:
-            uvs = [(0.0, 0.0)] * len(verts)
-            colors = [((0.0,0.0,0.0,0.0), (0.0,0.0,0.0,0.0))] * len(verts)
-            bone_data = [extract_bone_data(v.index) for v in bm.verts]
-
-        bm.free()
-        if len(verts) > 65535:
-            raise VertexLimitError(len(verts), mesh_name=obj.name)
-        return verts, faces, uvs, bone_data, colors
-
-    attr_layer = bm.faces.layers.int.get("cgml_submesh")
-    if attr_layer:
-        n_mats = 0
-        for face in bm.faces:
-            n_mats = max(n_mats, face[attr_layer] + 1)
-        n_mats = max(n_mats, 1)
-    else:
-        n_mats = max(len(obj.material_slots), 1)
+    n_mats = max(len(mesh.materials), 1) if split_by_material else 1
 
     vert_maps = [dict() for _ in range(n_mats)]
     vert_lists = [[] for _ in range(n_mats)]
     face_lists = [[] for _ in range(n_mats)]
     uv_lists = [[] for _ in range(n_mats)]
     bone_lists = [[] for _ in range(n_mats)]
-    color_lists = [[] for _ in range(n_mats)]
+    normal_lists = [[] for _ in range(n_mats)]
+    tangent_lists = [[] for _ in range(n_mats)]
 
-    for face in bm.faces:
-        if attr_layer:
-            mat_idx = face[attr_layer]
-            if mat_idx < 0 or mat_idx >= n_mats: mat_idx = n_mats - 1
-        else:
-            mat_idx = min(face.material_index, n_mats - 1)
+    for poly in mesh.polygons:
+        mat_idx = min(poly.material_index, n_mats - 1) if split_by_material else 0
+        
         vm = vert_maps[mat_idx]
         vl = vert_lists[mat_idx]
         fl = face_lists[mat_idx]
         ul = uv_lists[mat_idx]
         bl = bone_lists[mat_idx]
-        cl = color_lists[mat_idx]
+        nl = normal_lists[mat_idx]
+        tl = tangent_lists[mat_idx]
 
         tri = []
-        for loop in face.loops:
-            v = loop.vert
-            uv = (loop[uv_layer].uv.x, loop[uv_layer].uv.y) if uv_layer else (0.0, 0.0)
-            c0 = loop[color_layer0] if color_layer0 else (0.0, 0.0, 0.0, 0.0)
-            c1 = loop[color_layer1] if color_layer1 else (0.0, 0.0, 0.0, 0.0)
-            key = (round(v.co.x, 4), round(v.co.y, 4), round(v.co.z, 4), round(uv[0], 4), round(uv[1], 4), c0, c1)
+        for loop_idx in poly.loop_indices:
+            loop = mesh.loops[loop_idx]
+            v_idx = loop.vertex_index
+            v = mesh.vertices[v_idx]
+            
+            u, v_c = uv_layer[loop_idx].uv[0], 1.0 - uv_layer[loop_idx].uv[1]
+            nx, ny, nz = loop.normal[0], loop.normal[1], loop.normal[2]
+            tx, ty, tz = loop.tangent[0], loop.tangent[1], loop.tangent[2]
+            
+            # The game engine's shader reads the W component of the tangent as an occlusion/mask multiplier.
+            # If we pass -1.0 (Blender's bitangent sign for mirrored UVs), the shader multiplies the pixel by -1.0, 
+            # creating massive pitch-black holes. We MUST force it to 1.0.
+            tsign = 1.0
+            
+            # Key now includes UVs, Normals, and Tangent Sign to split along seams and mirrored UV bounds without fracturing smooth faces.
+            key = (v_idx, round(u, 4), round(v_c, 4), round(nx, 4), round(ny, 4), round(nz, 4), tsign)
+            
             if key not in vm:
                 vm[key] = len(vl)
                 vl.append((v.co.x, v.co.y, v.co.z))
-                ul.append(uv)
-                bl.append(extract_bone_data(v.index))
-                cl.append((c0, c1))
+                ul.append((u, v_c))
+                bl.append(extract_bone_data(v_idx))
+                nl.append((nx, ny, nz))
+                tl.append((tx, ty, tz, tsign))
+                
             tri.append(vm[key])
+            
         fl.append(tuple(tri))
 
-    bm.free()
+    eval_obj.to_mesh_clear()
+
+    if not split_by_material:
+        if len(vert_lists[0]) > 65535:
+            raise ValueError(f"Mesh '{obj.name}' has {len(vert_lists[0])} vertices. Decimate below 65536.")
+        return vert_lists[0], face_lists[0], uv_lists[0], bone_lists[0], normal_lists[0], tangent_lists[0]
 
     result = []
     for i in range(n_mats):
         if vert_lists[i] and face_lists[i]:
             if len(vert_lists[i]) > 65535:
-                raise VertexLimitError(len(vert_lists[i]), mesh_name=f"Material slot {i} of '{obj.name}'")
-            result.append((vert_lists[i], face_lists[i], uv_lists[i], bone_lists[i], color_lists[i]))
+                raise ValueError(f"Material slot {i} has {len(vert_lists[i])} vertices. Decimate below 65536.")
+            result.append((vert_lists[i], face_lists[i], uv_lists[i], bone_lists[i], normal_lists[i], tangent_lists[i]))
     return result
-
 
 def encode_primary_described_full_replace(
         original_gpu_bytes,
@@ -593,10 +520,10 @@ def encode_primary_described_full_replace(
         faces,
         uvs=None,
         bone_data=None,
-        colors=None,
+        normals=None,
+        tangents=None,
         stream0_stride=None,
-        compute_normals=True,
-        enforce_size_limit=True):
+        compute_normals=True):
     import struct
 
     _validate_mesh(verts, faces, "primary_described_full_replace")
@@ -604,28 +531,20 @@ def encode_primary_described_full_replace(
     if len(original_primary_bytes) < 64:
         raise ValueError("Original Primary is too small.")
 
-    orig_gpu_size = len(original_gpu_bytes)
-    
     max_orig_vc = 0
     orig_s0_sz = 0
     detected_stride = None
     n_meta = len(original_primary_bytes)
     for off in range(0, n_meta - 60, 4):
-        val = struct.unpack_from('<I', original_primary_bytes, off)[0]
-        if val == 0x0B:
+        if struct.unpack_from('<I', original_primary_bytes, off)[0] == 0x0B:
             vc = struct.unpack_from('<I', original_primary_bytes, off + 7*4)[0]
             if vc > max_orig_vc:
                 max_orig_vc = vc
                 orig_s0_sz = struct.unpack_from('<I', original_primary_bytes, off + 4*4)[0]
-            if detected_stride is None:
-                s0_sz = struct.unpack_from('<I', original_primary_bytes, off + 4*4)[0]
-                if vc > 0 and s0_sz % vc == 0:
-                    cand = s0_sz // vc
-                    if 12 <= cand <= 64:
-                        detected_stride = cand
-
+                break
+                
     if stream0_stride is None:
-        stream0_stride = detected_stride if detected_stride is not None else 16
+        stream0_stride = orig_s0_sz // max_orig_vc if max_orig_vc > 0 else 16
 
     real_nv = len(verts)
 
@@ -636,24 +555,29 @@ def encode_primary_described_full_replace(
         if uvs:
             last_uv = uvs[-1] if uvs else (0.0, 0.0)
             uvs = list(uvs) + [last_uv] * padding_count
-        if bone_data:
-            last_bone = bone_data[-1] if bone_data else ((0,0,0,0), (0,0,0,0))
-            bone_data = list(bone_data) + [last_bone] * padding_count
+        if normals:
+            last_n = normals[-1] if normals else (0.0, 1.0, 0.0)
+            normals = list(normals) + [last_n] * padding_count
+        if tangents:
+            last_t = tangents[-1] if tangents else (1.0, 0.0, 0.0, 1.0)
+            tangents = list(tangents) + [last_t] * padding_count
 
     nv = len(verts)
     nt = len(faces)
     
-    s0 = _pack_stream0_dynamic(nv, stream0_stride, uvs=uvs, bone_data=bone_data, colors=colors)
+    s0 = _pack_stream0_dynamic(nv, stream0_stride, uvs=uvs, bone_data=bone_data)
     if compute_normals:
-        normals = _compute_smooth_normals(verts, faces)
-        s1 = _pack_stream1_with_normals(verts, normals, bone_data=bone_data)
+        if not normals:
+            normals = _compute_smooth_normals(verts, faces)
+        s1 = _pack_stream1_with_normals(verts, normals, tangents=tangents, bone_data=bone_data)
     else:
         s1 = _pack_stream1_zeroed(verts, bone_data=bone_data)
 
     ib = _pack_index_buffer_u16(faces)
     new_gpu = bytearray(s0 + s1 + ib)
 
-    # Pad to original size ONLY if smaller. If larger, we just let it be larger.
+    # Pad to original size
+    orig_gpu_size = len(original_gpu_bytes)
     if len(new_gpu) < orig_gpu_size:
         new_gpu += b'\x00' * (orig_gpu_size - len(new_gpu))
     
@@ -661,131 +585,21 @@ def encode_primary_described_full_replace(
     index_offset  = stream0_size + nv * 28
     index_count   = nt * 3
 
-    # --- Bounding Box Patching ---
-    # Calculate original bounds to find where they are stored in the Primary file
-    orig_xs, orig_ys, orig_zs = [], [], []
-    if orig_s0_sz > 0 and max_orig_vc > 0:
-        for i in range(max_orig_vc):
-            off = orig_s0_sz + i * 28
-            if off + 12 <= len(original_gpu_bytes):
-                x, y, z = struct.unpack_from('<fff', original_gpu_bytes, off)
-                orig_xs.append(x); orig_ys.append(y); orig_zs.append(z)
-                
     patched_primary = bytearray(original_primary_bytes)
-    
-    if orig_xs and orig_ys and orig_zs:
-        orig_bounds = (min(orig_xs), min(orig_ys), min(orig_zs), max(orig_xs), max(orig_ys), max(orig_zs))
-        
-        # Calculate new bounds
-        new_xs = [v[0] for v in verts]; new_ys = [v[1] for v in verts]; new_zs = [v[2] for v in verts]
-        new_bounds = (min(new_xs), min(new_ys), min(new_zs), max(new_xs), max(new_ys), max(new_zs))
-        
-        # Find the best matching bounding box in the Primary file
-        best_off = -1
-        best_diff = float('inf')
-        for off in range(0, len(patched_primary) - 24, 4):
-            vals = struct.unpack_from('<ffffff', patched_primary, off)
-            if vals[0] < vals[3] and vals[1] < vals[4] and vals[2] < vals[5]:
-                diff = sum(abs(a - b) for a, b in zip(vals, orig_bounds))
-                if diff < best_diff and diff < 1.0: # Must be reasonably close
-                    best_diff = diff
-                    best_off = off
-                    
-        # If we found the LOD0 bounding box, patch it and all subsequent LOD bounding boxes (stride 0x98)
-        if best_off != -1:
-            curr_off = best_off
-            while curr_off + 24 <= len(patched_primary):
-                vals = struct.unpack_from('<ffffff', patched_primary, curr_off)
-                # Check if it looks like a bounding box
-                if vals[0] < vals[3] and vals[1] < vals[4] and vals[2] < vals[5]:
-                    massive_bounds = (-9999.0, -9999.0, -9999.0, 9999.0, 9999.0, 9999.0)
-                    struct.pack_into('<ffffff', patched_primary, curr_off, *massive_bounds)
-                    curr_off += 0x98
-                else:
-                    break
+    for off in range(0, n_meta - 60, 4):
+        val = struct.unpack_from('<I', patched_primary, off)[0]
+        if val == 0x0B:
+            vc = struct.unpack_from('<I', patched_primary, off + 7*4)[0]
+            vc2 = struct.unpack_from('<I', patched_primary, off + 8*4)[0]
+            vc3 = struct.unpack_from('<I', patched_primary, off + 11*4)[0]
+            if vc == vc2 == vc3 and vc > 0:
+                orig_ioff = struct.unpack_from('<I', patched_primary, off + 12*4)[0]
+                for field_index, value in [(2,0), (4,stream0_size), (7,nv), (8,nv), (11,nv)]:
+                    struct.pack_into('<I', patched_primary, off + field_index * 4, value)
+                if orig_ioff < orig_gpu_size:
+                    for field_index, value in [(12,index_offset), (13,index_count)]:
+                        struct.pack_into('<I', patched_primary, off + field_index * 4, value)
 
-    # Collect all 0x0B blocks and identify which one has rkind=2 (direct index, always works)
-    blocks = []
-    rkind2_idx = -1
-    for off in range(0, n_meta - 64, 4):
-        if struct.unpack_from('<I', patched_primary, off)[0] == 0x0B:
-            vals = [struct.unpack_from('<I', patched_primary, off + i*4)[0] for i in range(16)]
-            vc = vals[7]
-            if vc > 0:
-                rk = vals[14]
-                blocks.append((off, vc, rk, vals[12]))
-                if rk == 2:
-                    rkind2_idx = len(blocks) - 1
-
-    # 1. Patch the 0x0B descriptor blocks (vertex counts, stream sizes, index pointers)
-    for blk_idx, (off, orig_vc_blk, rk, orig_ioff) in enumerate(blocks):
-        # Patch vertex buffer layout for ALL blocks
-        for field_index, value in [(2,0), (4,stream0_size), (7,nv), (8,nv), (11,nv)]:
-            struct.pack_into('<I', patched_primary, off + field_index * 4, value)
-        
-        # Only patch index_offset and index_count for the rkind=2 block.
-        # Sentinel blocks (rkind=0x0308000B) MUST keep their magic ioff/icnt/rkind values
-        # or the engine crashes.
-        if orig_ioff < orig_gpu_size:
-            struct.pack_into('<I', patched_primary, off + 12 * 4, index_offset)
-            struct.pack_into('<I', patched_primary, off + 13 * 4, index_count)
-
-        # 2. Patch Stream Records (matching orig_vc_blk)
-        for soff in range(0, n_meta - 32, 8):
-            if struct.unpack_from('<I', patched_primary, soff)[0] == 4:
-                val2 = struct.unpack_from('<I', patched_primary, soff + 2*4)[0]
-                val4 = struct.unpack_from('<I', patched_primary, soff + 4*4)[0]
-                if val2 == orig_vc_blk:
-                    struct.pack_into('<I', patched_primary, soff + 2*4, nv)
-                    struct.pack_into('<I', patched_primary, soff + 4*4, index_count)
-                elif val4 == orig_vc_blk:
-                    struct.pack_into('<I', patched_primary, soff + 4*4, nv)
-
-    # 3. Patch LOD distance table — make the rkind=2 LOD cover ALL distances (0 to max).
-    #    Sentinel LOD entries are disabled so the engine never tries to use them.
-    if blocks and rkind2_idx >= 0:
-        lod_array_off = blocks[-1][0] + 0x150
-        n_lod_records = len(blocks)
-        if lod_array_off + n_lod_records * 24 <= n_meta:
-            # Read the max far distance from the original LOD table
-            last_record = lod_array_off + (n_lod_records - 1) * 24
-            orig_far_end = struct.unpack_from('<f', patched_primary, last_record + 5*4)[0]
-            if orig_far_end < 10.0:
-                orig_far_end = 65.0  # Safe default
-            
-            for i in range(n_lod_records):
-                record_off = lod_array_off + i * 24
-                if i == rkind2_idx:
-                    # This is the working LOD — extend it to cover ALL distances to infinity
-                    struct.pack_into('<f', patched_primary, record_off + 2*4, 0.0)   # near_start = 0
-                    struct.pack_into('<f', patched_primary, record_off + 3*4, 0.0)   # near_end = 0
-                    struct.pack_into('<f', patched_primary, record_off + 4*4, 999999.0)  # far_start
-                    struct.pack_into('<f', patched_primary, record_off + 5*4, 999999.0)  # far_end
-                else:
-                    # Disable this LOD entry — push it infinitely far away so it never activates
-                    struct.pack_into('<f', patched_primary, record_off + 2*4, 999999.0)
-                    struct.pack_into('<f', patched_primary, record_off + 3*4, 999999.0)
-                    struct.pack_into('<f', patched_primary, record_off + 4*4, 999999.0)
-                    struct.pack_into('<f', patched_primary, record_off + 5*4, 999999.0)
-
-    # --- Fallback Metadata Patching (for CGML-like CIMR files) ---
-    # 1. Patch 0xFFFFFF0C descriptors
-    for off in range(0, n_meta - 64 + 1, 4):
-        if struct.unpack_from('<I', patched_primary, off)[0] == 0xffffff0c and struct.unpack_from('<I', patched_primary, off + 4)[0] == 0xffffffff:
-            kind = struct.unpack_from('<I', patched_primary, off + 8)[0]
-            if kind in (11, 13) and struct.unpack_from('<I', patched_primary, off + 12)[0] == 0:
-                struct.pack_into('<I', patched_primary, off + 16, 0) # base_offset
-                struct.pack_into('<I', patched_primary, off + 24, stream0_size)
-                struct.pack_into('<I', patched_primary, off + 36, nv)
-                struct.pack_into('<I', patched_primary, off + 40, nv)
-
-    # 2. Patch index records (idx_off, idx_count, r_kind, r_extra)
-    for off in range(0, n_meta - 16 + 1, 4):
-        idx_off, idx_count, r_kind, r_extra = struct.unpack_from("<IIII", patched_primary, off)
-        if r_kind in (2, 4) and r_extra == 0 and idx_count >= 3 and idx_count % 3 == 0 and idx_off >= 1024 and idx_off % 2 == 0:
-            struct.pack_into('<I', patched_primary, off, index_offset)
-            struct.pack_into('<I', patched_primary, off + 4, index_count)
-            
     return bytes(new_gpu), bytes(patched_primary)
 
 def encode_primary_described_multi_submesh_replace(
@@ -793,8 +607,7 @@ def encode_primary_described_multi_submesh_replace(
         original_primary_bytes,
         submesh_list,
         stream0_stride=None,
-        compute_normals=True,
-        enforce_size_limit=True):
+        compute_normals=True):
     import struct
 
     expected_blocks = []
@@ -833,15 +646,23 @@ def encode_primary_described_multi_submesh_replace(
         off, orig_vc, s0_sz, orig_fc = expected_blocks[idx]
         if idx < len(submesh_list):
             sub = submesh_list[idx]
-            if len(sub) == 4:
+            if len(sub) == 6:
+                verts, faces, uvs, bone_data, normals, tangents = sub
+            elif len(sub) == 4:
                 verts, faces, uvs, bone_data = sub
+                normals = None
+                tangents = None
             elif len(sub) == 3:
                 verts, faces, uvs = sub
                 bone_data = None
+                normals = None
+                tangents = None
             else:
                 verts, faces = sub
                 uvs = None
                 bone_data = None
+                normals = None
+                tangents = None
                 
             if orig_vc > len(verts):
                 padding_count = orig_vc - len(verts)
@@ -850,27 +671,36 @@ def encode_primary_described_multi_submesh_replace(
                 if uvs:
                     last_uv = uvs[-1] if uvs else (0.0, 0.0)
                     uvs = list(uvs) + [last_uv] * padding_count
+                if normals:
+                    last_n = normals[-1] if normals else (0.0, 1.0, 0.0)
+                    normals = list(normals) + [last_n] * padding_count
+                if tangents:
+                    last_t = tangents[-1] if tangents else (1.0, 0.0, 0.0, 1.0)
+                    tangents = list(tangents) + [last_t] * padding_count
         else:
             verts = [(0.0, 0.0, 0.0)] * orig_vc
             faces = [(0, 0, 0)] * orig_fc
             uvs = [(0.0, 0.0)] * orig_vc
+            normals = None
+            tangents = None
             
-        processed_subs.append((verts, faces, uvs, bone_data))
+        processed_subs.append((verts, faces, uvs, bone_data, normals, tangents))
 
     new_gpu = bytearray()
     submesh_offsets = []
     current_offset = 0
 
-    for idx, (verts, faces, uvs, bone_data) in enumerate(processed_subs):
+    for idx, (verts, faces, uvs, bone_data, normals, tangents) in enumerate(processed_subs):
         allow_degen = (idx >= len(submesh_list))
         _validate_mesh(verts, faces, f"multi_submesh_replace submesh {idx}", allow_degenerate=allow_degen)
         nv = len(verts)
         nt = len(faces)
 
-        s0 = _pack_stream0_dynamic(nv, stream0_stride, uvs=uvs, bone_data=bone_data, colors=colors)
+        s0 = _pack_stream0_dynamic(nv, stream0_stride, uvs=uvs, bone_data=bone_data)
         if compute_normals:
-            normals = _compute_smooth_normals(verts, faces)
-            s1 = _pack_stream1_with_normals(verts, normals, bone_data=bone_data)
+            if normals is None:
+                normals = _compute_smooth_normals(verts, faces)
+            s1 = _pack_stream1_with_normals(verts, normals, tangents=tangents, bone_data=bone_data)
         else:
             s1 = _pack_stream1_zeroed(verts, bone_data=bone_data)
         ib = _pack_index_buffer_u16(faces)
@@ -892,9 +722,6 @@ def encode_primary_described_multi_submesh_replace(
     if len(new_gpu) < orig_gpu_size:
         padding = orig_gpu_size - len(new_gpu)
         new_gpu += b'\x00' * padding
-    elif len(new_gpu) > orig_gpu_size:
-        if enforce_size_limit:
-            raise EncodeSizeError(len(new_gpu), orig_gpu_size)
 
     patched_primary = bytearray(original_primary_bytes)
     block_index = 0
@@ -911,18 +738,21 @@ def encode_primary_described_multi_submesh_replace(
                     target_rk = 2
                     struct.pack_into('<I', patched_primary, off + 14*4, target_rk)
 
+                    orig_ioff = struct.unpack_from('<I', patched_primary, off + 12*4)[0]
                     fields = [
                         (2, s0_start),
                         (4, s0_size),
                         (7, nv),
                         (8, nv),
                         (11, nv),
-                        (12, ib_offset),
-                        (13, ib_count),
                     ]
 
                     for field_index, value in fields:
                         struct.pack_into('<I', patched_primary, off + field_index * 4, value)
+                        
+                    if orig_ioff < orig_gpu_size:
+                        for field_index, value in [(12, ib_offset), (13, ib_count)]:
+                            struct.pack_into('<I', patched_primary, off + field_index * 4, value)
 
                     block_index += 1
 
@@ -983,7 +813,7 @@ def patch_primary_described_positions(original_gpu_bytes, original_primary_bytes
 
     return bytes(patched), original_primary_bytes
 
-def encode_cgml_primary_replace(original_gpu_bytes, original_primary_bytes, submesh_list, stream0_stride=None, compute_normals=False, enforce_size_limit=True):
+def encode_cgml_primary_replace(original_gpu_bytes, original_primary_bytes, submesh_list, stream0_stride=None, compute_normals=False):
     import struct
     import math
 
@@ -1061,18 +891,28 @@ def encode_cgml_primary_replace(original_gpu_bytes, original_primary_bytes, subm
             # Base submesh - generate unique geometry
             if base_idx < len(submesh_list):
                 sub = submesh_list[base_idx]
-                if len(sub) == 4:
+                if len(sub) == 6:
+                    verts, faces, uvs, bone_data, normals, tangents = sub
+                elif len(sub) == 4:
                     verts, faces, uvs, bone_data = sub
+                    normals = None
+                    tangents = None
                 elif len(sub) == 3:
                     verts, faces, uvs = sub
                     bone_data = None
+                    normals = None
+                    tangents = None
                 else:
-                    verts, faces, uvs, bone_data = sub[0], sub[1], None, None
+                    verts, faces = sub[0], sub[1]
+                    uvs = None
+                    bone_data = None
+                    normals = None
+                    tangents = None
                 if len(verts) > 65535: raise ValueError("Submesh exceeds 65535 vertices.")
                 if uvs and len(uvs) < len(verts):
                     uvs = list(uvs) + [(0.0, 0.0)] * (len(verts) - len(uvs))
             else:
-                verts, faces, uvs, bone_data = [(0.0, 0.0, 0.0)] * 3, [(0, 1, 2)], [(0.0, 0.0)] * 3, None
+                verts, faces, uvs, bone_data, normals, tangents = [(0.0, 0.0, 0.0)] * 3, [(0, 1, 2)], [(0.0, 0.0)] * 3, None, None, None
 
             nv = len(verts)
             nt = len(faces)
@@ -1094,10 +934,19 @@ def encode_cgml_primary_replace(original_gpu_bytes, original_primary_bytes, subm
                 if orig_s1_start + s1_stride * orig_vc <= len(original_gpu_bytes):
                     orig_stream1 = original_gpu_bytes[orig_s1_start : orig_s1_start + s1_stride * orig_vc]
             
+            if base_idx < len(submesh_list):
+                # Never merge original stream data with a Blender mesh, the vertex order is completely different!
+                orig_stream0 = None
+                orig_stream1 = None
+            
             s0 = _pack_stream0_dynamic(nv, s0_stride, uvs=uvs, bone_data=bone_data, orig_word1=orig_word1, orig_word0=orig_word0, orig_stream0=orig_stream0)
+            
+            is_static = (orig_word1 == 0xFFFF0000)
+            
             if compute_normals:
-                normals = _compute_smooth_normals(verts, faces)
-                s1 = _pack_stream1_with_normals(verts, normals, bone_data=bone_data, orig_stream1=orig_stream1, s1_stride=s1_stride)
+                if normals is None:
+                    normals = _compute_smooth_normals(verts, faces)
+                s1 = _pack_stream1_with_normals(verts, normals, tangents=tangents, bone_data=bone_data, orig_stream1=orig_stream1, s1_stride=s1_stride, force_snorm16=is_static)
             else:
                 s1 = _pack_stream1_zeroed(verts, bone_data=bone_data, orig_stream1=orig_stream1, s1_stride=s1_stride)
             ib = _pack_index_buffer_u16(faces)
@@ -1154,13 +1003,12 @@ def encode_cgml_primary_replace(original_gpu_bytes, original_primary_bytes, subm
             min_z, max_z = min(zs), max(zs)
             struct.pack_into("<ffffff", patched_primary, a0_off + 0x3c, min_x, min_y, min_z, max_x, max_y, max_z)
 
-    # Pad GPU binary to exact original size if smaller
+    # Pad GPU binary to exact original size
     orig_gpu_size = len(original_gpu_bytes)
     if len(new_gpu) < orig_gpu_size:
         new_gpu += b"\x00" * (orig_gpu_size - len(new_gpu))
     elif len(new_gpu) > orig_gpu_size:
-        if enforce_size_limit:
-            raise EncodeSizeError(len(new_gpu), orig_gpu_size)
+        raise ValueError(f"New GPU size {len(new_gpu)} is larger than original {orig_gpu_size}. Please decimate the mesh further.")
 
     return bytes(new_gpu), bytes(patched_primary)
 

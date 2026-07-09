@@ -124,7 +124,6 @@ def _extract_submesh(data, s0_start, Nv, s0_stride):
 
     uvs = []
     bone_data = []
-    colors = []
     has_valid_bones = False
 
     if s0_stride >= 16:
@@ -139,21 +138,17 @@ def _extract_submesh(data, s0_start, Nv, s0_stride):
             weights = struct.unpack_from("<4B", data, s0_off)
             indices = struct.unpack_from("<4B", data, s1_start + j * 28 + 20)
             bone_data.append((indices, weights))
-            w0 = struct.unpack_from("<4B", data, s0_off)
-            w1 = struct.unpack_from("<4B", data, s0_off + 4)
-            colors.append(((w0[0]/255.0, w0[1]/255.0, w0[2]/255.0, w0[3]/255.0), (w1[0]/255.0, w1[1]/255.0, w1[2]/255.0, w1[3]/255.0)))
 
             if sum(weights) > 50:
                 has_valid_bones = True
     else:
         uvs = [(0.0, 0.0)] * Nv
         bone_data = [((0,0,0,0), (0,0,0,0))] * Nv
-        colors = [((0.0,0.0,0.0,0.0), (0.0,0.0,0.0,0.0))] * Nv
 
     if not has_valid_bones:
         bone_data = None
 
-    return verts, faces, uvs, bone_data, colors, colors
+    return verts, faces, uvs, bone_data
 
 
 # ============================================================
@@ -265,7 +260,6 @@ def _extract_primary_described_cimr_mesh(gpu_data, primary_data):
             s0_stride = stream0_size // vertex_count
             uvs = []
             bone_data = []
-            colors = []
             has_valid_bones = False
             
             if s0_stride >= 16:
@@ -279,22 +273,18 @@ def _extract_primary_described_cimr_mesh(gpu_data, primary_data):
                     weights = struct.unpack_from("<4B", gpu_data, s0_off)
                     indices = struct.unpack_from("<4B", gpu_data, pos_start + j * 28 + pos_off + 20)
                     bone_data.append((indices, weights))
-                    w0 = struct.unpack_from("<4B", gpu_data, s0_off)
-                    w1 = struct.unpack_from("<4B", gpu_data, s0_off + 4)
-                    colors.append(((w0[0]/255.0, w0[1]/255.0, w0[2]/255.0, w0[3]/255.0), (w1[0]/255.0, w1[1]/255.0, w1[2]/255.0, w1[3]/255.0)))
                     if sum(weights) > 50:
                         has_valid_bones = True
             else:
                 uvs = [(0.0, 0.0)] * vertex_count
                 bone_data = [((0,0,0,0), (0,0,0,0))] * vertex_count
-                colors = [((0.0,0.0,0.0,0.0), (0.0,0.0,0.0,0.0))] * vertex_count
 
             if not has_valid_bones:
                 bone_data = None
             else:
                 print('Found valid bones!')
 
-            candidate = (len(faces), vertex_count, -pos_off, verts, faces, uvs, bone_data, colors)
+            candidate = (len(faces), vertex_count, -pos_off, verts, faces, uvs, bone_data)
             if best is None or candidate[:3] > best[:3]:
                 best = candidate
             break
@@ -582,7 +572,6 @@ def _extract_cgml_ranges(gpu_data, base_offset, stream0_size, vertex_count,
     s0_stride = stream0_size // vertex_count if vertex_count else 16
     uvs = []
     bone_data = []
-    colors = []
     has_valid_bones = False
     
     if s0_stride >= 16:
@@ -604,20 +593,16 @@ def _extract_cgml_ranges(gpu_data, base_offset, stream0_size, vertex_count,
                 indices = struct.unpack_from("<4B", gpu_data, ib_start - vertex_count * 28 + j * 28 + 16)
             
             bone_data.append((indices, weights))
-            w0 = struct.unpack_from("<4B", gpu_data, s0_off)
-            w1 = struct.unpack_from("<4B", gpu_data, s0_off + 4)
-            colors.append(((w0[0]/255.0, w0[1]/255.0, w0[2]/255.0, w0[3]/255.0), (w1[0]/255.0, w1[1]/255.0, w1[2]/255.0, w1[3]/255.0)))
             if sum(weights) > 50:
                 has_valid_bones = True
     else:
         uvs = [(0.0, 0.0)] * vertex_count
         bone_data = [((0,0,0,0), (0,0,0,0))] * vertex_count
-        colors = [((0.0,0.0,0.0,0.0), (0.0,0.0,0.0,0.0))] * vertex_count
 
     if not has_valid_bones:
         bone_data = None
 
-    return verts, faces, uvs, bone_data, colors, colors
+    return verts, faces, uvs, bone_data
 
 
 def _decode_compact_cgml(meta, gpu_data):
@@ -799,19 +784,13 @@ def _extract_metadata_meshes(gpu_data, primary_data):
                     if range_kind not in (2, 4) or range_extra != 0 or index_size == 0:
                         continue
 
-                    mat_index = 0
-                    if array1_count == array2_count and i < array1_count:
-                        stream_rec_off = array1_base + i * 0x70
-                        if stream_rec_off + 0x2c <= len(meta):
-                            mat_index = struct.unpack_from("<I", meta, stream_rec_off + 0x28)[0]
-
                     index_stride = 4 if range_kind == 4 else 2
                     index_count = index_size
                     result = _extract_cgml_ranges(
                         gpu_data, base_offset, stream0_size, vertex_count,
                         index_count, 28, index_offset, index_stride)
                     if result is not None:
-                        submeshes.append((*result, mat_index))
+                        submeshes.append(result)
 
     if not submeshes:
         stream_records = []
