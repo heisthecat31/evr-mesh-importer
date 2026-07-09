@@ -40,6 +40,7 @@ from .encode import (
     encode_heuristic_dual28,
     encode_cgml,
     mesh_from_blender_object,
+    VertexLimitError,
 )
 from .textures import apply_textures_to_objects
 
@@ -396,6 +397,32 @@ class EVR_ExportSettings(bpy.types.PropertyGroup):
     scale: FloatProperty(name="Scale", default=1.0)
 
 
+class EVR_OT_AutoAtlas(bpy.types.Operator):
+    """Bake and pack materials into a single texture atlas, scale UVs, and join selected meshes"""
+    bl_idname = "evr.auto_atlas"
+    bl_label = "Auto-Atlas Materials & Join"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    atlas_res: bpy.props.IntProperty(name="Atlas Resolution", default=2048, min=512, max=8192)
+    
+    @classmethod
+    def poll(cls, context):
+        return context.selected_objects and all(o.type == 'MESH' for o in context.selected_objects)
+        
+    def execute(self, context):
+        import importlib
+        from . import atlas
+        importlib.reload(atlas)
+        from .atlas import auto_atlas_objects
+        success, msg = auto_atlas_objects(context, context.selected_objects, self.atlas_res)
+        if success:
+            self.report({'INFO'}, msg)
+            return {'FINISHED'}
+        else:
+            self.report({'ERROR'}, msg)
+            return {'CANCELLED'}
+
+
 class EVR_OT_TransferWeights(bpy.types.Operator):
     """Transfer weights from original EVR mesh to custom mesh"""
     bl_idname = "evr.transfer_weights"
@@ -504,6 +531,7 @@ class EVR_PT_ExportPanel(bpy.types.Panel):
         layout.label(text="Utilities:")
         row = layout.row()
         row.operator("evr.transfer_weights", text="Transfer Weights", icon='MOD_DATA_TRANSFER')
+        row.operator("evr.auto_atlas", text="Auto-Atlas & Join", icon='TEXTURE')
         layout.separator()
         layout.operator("export_mesh.evr_raw", text="Export EVR Mesh (Replace)", icon='EXPORT')
         layout.operator("export_mesh.evr_replace_textures", text="Replace Textures Manually", icon='TEXTURE')
@@ -803,12 +831,29 @@ class EVR_OT_ExportMesh(Operator):
                     submeshes = []
                     do_split = (len(export_objs) == 1)
                     for eo in export_objs:
-                        if do_split:
-                            submeshes.extend(mesh_from_blender_object(eo, apply_transforms=True, split_by_material=True))
-                        else:
-                            submeshes.append(mesh_from_blender_object(eo, apply_transforms=True, split_by_material=False))
+                        mod = None
+                        if settings.auto_decimate and ratio < 1.0:
+                            mod = eo.modifiers.new(name='AutoDecimate', type='DECIMATE')
+                            mod.ratio = ratio
+                        try:
+                            if do_split:
+                                submeshes.extend(mesh_from_blender_object(eo, apply_transforms=True, split_by_material=True))
+                            else:
+                                submeshes.append(mesh_from_blender_object(eo, apply_transforms=True, split_by_material=False))
+                        finally:
+                            if mod:
+                                eo.modifiers.remove(mod)
                 else:
-                    res = mesh_from_blender_object(obj, apply_transforms=True, split_by_material=False)
+                    mod = None
+                    if settings.auto_decimate and ratio < 1.0:
+                        mod = obj.modifiers.new(name='AutoDecimate', type='DECIMATE')
+                        mod.ratio = ratio
+                    try:
+                        res = mesh_from_blender_object(obj, apply_transforms=True, split_by_material=False)
+                    finally:
+                        if mod:
+                            obj.modifiers.remove(mod)
+                            
                     verts, faces, uvs = res[0], res[1], res[2]
                     bone_data = res[3] if len(res) > 3 else None
                     normals = res[4] if len(res) > 4 else None
@@ -1701,6 +1746,7 @@ def register():
     bpy.utils.register_class(EVR_OT_ImportAndReplace)
     bpy.utils.register_class(EVR_OT_ExportMesh)
     bpy.utils.register_class(EVR_OT_ReplaceTextures)
+    bpy.utils.register_class(EVR_OT_AutoAtlas)
     bpy.utils.register_class(EVR_OT_DumpModelData)
     bpy.types.Scene.evr_export_settings = bpy.props.PointerProperty(type=EVR_ExportSettings)
     bpy.types.Scene.evr_preview_image = bpy.props.PointerProperty(type=bpy.types.Image)
@@ -1719,6 +1765,7 @@ def unregister():
     bpy.utils.unregister_class(EVR_OT_ImportAndReplace)
     bpy.utils.unregister_class(EVR_OT_ExportMesh)
     bpy.utils.unregister_class(EVR_OT_ReplaceTextures)
+    bpy.utils.unregister_class(EVR_OT_AutoAtlas)
     bpy.utils.unregister_class(EVR_OT_DumpModelData)
     bpy.utils.unregister_class(EVR_OT_TransferWeights)
     bpy.utils.unregister_class(EVR_PT_ExportPanel)

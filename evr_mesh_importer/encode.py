@@ -6,6 +6,12 @@ Writes replacement GPU binaries in the layouts Echo VR expects.
 import struct
 import math
 
+class VertexLimitError(Exception):
+    def __init__(self, current_verts, max_verts=65535, mesh_name="Unknown"):
+        self.current_verts = current_verts
+        self.max_verts = max_verts
+        self.mesh_name = mesh_name
+        super().__init__(f"Mesh '{mesh_name}' exceeds vertex/size limit: {current_verts} > {max_verts}")
 
 # ============================================================
 # Math helpers
@@ -1008,7 +1014,7 @@ def encode_cgml_primary_replace(original_gpu_bytes, original_primary_bytes, subm
     if len(new_gpu) < orig_gpu_size:
         new_gpu += b"\x00" * (orig_gpu_size - len(new_gpu))
     elif len(new_gpu) > orig_gpu_size:
-        raise ValueError(f"New GPU size {len(new_gpu)} is larger than original {orig_gpu_size}. Please decimate the mesh further.")
+        raise VertexLimitError(len(new_gpu), max_verts=orig_gpu_size, mesh_name="GPU Size Limit")
 
     return bytes(new_gpu), bytes(patched_primary)
 
